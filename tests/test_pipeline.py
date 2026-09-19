@@ -4,7 +4,9 @@
 import asyncio
 import base64
 import json
+import socket
 import sys
+import urllib.error
 import zlib
 import struct
 from pathlib import Path
@@ -98,6 +100,142 @@ def test_extract_image_payload_reports_what_is_available() -> None:
 def test_download_image_rejects_non_http() -> None:
     assert imaging.download_image("file:///etc/passwd") is None
     assert imaging.download_image("") is None
+
+
+class _FakeResponse:
+    """够用的假响应：支持 with / read / status。"""
+
+    def __init__(self, payload: bytes = b"x" * 8, status: int = 200) -> None:
+        self._payload, self.status = payload, status
+
+    def read(self, size: int = -1) -> bytes:
+        return self._payload
+
+    def __enter__(self) -> "_FakeResponse":
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+
+def _fake_resolver(mapping: "dict[str, str]"):
+    def _getaddrinfo(host, port, *args, **kwargs):
+        if host not in mapping:
+            raise socket.gaierror(f"unknown host {host}")
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (mapping[host], 0))]
+    return _getaddrinfo
+
+
+def test_download_image_blocks_private_targets_but_keeps_public_ones(monkeypatch) -> None:
+    """SSRF 守卫：内网 / 回环 / link-local / 解析到内网的域名，**不建立连接**。
+
+    图片 URL 来自入站消息组件，是攻击者可控的。断言"连接没建立"才是真的挡住了 SSRF
+    ——只断言返回 None，一个"先连上再放弃"的实现也能通过。
+
+    同时必须验证**公网目标照常放行**：加固不能把正常功能一起杀掉。
+    """
+    contacted: list[str] = []
+    monkeypatch.setattr(imaging.socket, "getaddrinfo", _fake_resolver({
+        "public.example.com": "93.184.216.34",
+        "evil.example.com": "192.168.1.10",         # 域名 A 记录指向内网
+        "v6-inner.example.com": "::1",              # IPv6 回环
+        "metadata.example.com": "169.254.169.254",  # link-local（云元数据）
+    }))
+
+    def fake_open(request, timeout=None):
+        contacted.append(request.full_url)
+        return _FakeResponse()
+
+    monkeypatch.setattr(imaging._OPENER, "open", fake_open)
+
+    assert imaging.download_image("http://public.example.com/a.png") == b"x" * 8
+    assert contacted == ["http://public.example.com/a.png"], "公网目标必须照常放行"
+
+    contacted.clear()
+    for url in (
+        "http://127.0.0.1/x.png",
+        "http://10.0.0.1/x.png",
+        "http://[::1]/x.png",
+        "http://evil.example.com/x.png",
+        "http://v6-inner.example.com/x.png",
+        "http://metadata.example.com/latest/meta-data/",
+        "http://unresolvable.invalid/x.png",
+        "file:///etc/passwd",
+        "",
+    ):
+        assert imaging.download_image(url) is None, url
+    assert contacted == [], f"不可信目标不该建立连接：{contacted}"
+
+
+def test_download_image_revalidates_each_redirect_hop(monkeypatch) -> None:
+    """一条 302 就足以把请求带出校验过的目标，所以**每跳都要重新校验**。
+
+    攻击手法：先给一个解析到公网的域名骗过检查，再 302 到 169.254.169.254。
+    只校验初始 URL 的实现会在这里把请求发进内网。
+    """
+    contacted: list[str] = []
+    monkeypatch.setattr(imaging.socket, "getaddrinfo", _fake_resolver({
+        "public.example.com": "93.184.216.34",
+        "evil.example.com": "192.168.1.10",
+    }))
+
+    def fake_open(request, timeout=None):
+        contacted.append(request.full_url)
+        raise urllib.error.HTTPError(
+            request.full_url, 302, "Found",
+            {"Location": "http://evil.example.com/steal"}, None,
+        )
+
+    monkeypatch.setattr(imaging._OPENER, "open", fake_open)
+    assert imaging.download_image("http://public.example.com/start.png") is None
+    assert contacted == ["http://public.example.com/start.png"], "第二跳的内网地址不该被请求"
+
+
+def test_extract_image_payload_edge_cases() -> None:
+    """入站图片组件是攻击者可控的：畸形输入必须**安静降级**，而不是抛异常。"""
+    for component in (None, [], "字符串", 42, {"type": "image"}, {"url": "javascript:alert(1)"}):
+        data, note = imaging.extract_image_payload(component)
+        assert data is None, component
+        assert isinstance(note, str) and note, f"必须给出可读原因，便于排障：{component!r}"
+
+
+def test_download_image_handles_malformed_urls(monkeypatch) -> None:
+    """畸形 URL 一律安静拒绝（不抛、不连接）。"""
+    contacted: list[str] = []
+    monkeypatch.setattr(
+        imaging.socket, "getaddrinfo", _fake_resolver({"public.example.com": "93.184.216.34"})
+    )
+    monkeypatch.setattr(
+        imaging._OPENER, "open", lambda request, timeout=None: contacted.append(request.full_url)
+    )
+    for url in ("http://", "http:///path", "//example.com/x", "ftp://example.com/x",
+                "data:image/png;base64,AAAA"):
+        assert imaging.download_image(url) is None, url
+    assert contacted == []
+
+
+def test_is_plausible_name_rejects_placeholders() -> None:
+    """占位符不能被当成角色名——否则「未知」「无」会参与匹配并出现在回执里。"""
+    for junk in ("", "  ", "unknown", "未识别", "无", "none", "null", "na", "1", "12"):
+        assert textutil.is_plausible_name(junk) is False, junk
+    for good in ("鸣澜", "阿罗娜", "初音ミク", "Miku", "アロナ"):
+        assert textutil.is_plausible_name(good) is True, good
+
+
+def test_names_from_label_ignores_unrecognized_marker() -> None:
+    """标签提取不能把「未识别」当成角色名。"""
+    plugin = _plugin_module()
+    assert plugin._names_from_label("") == []
+    assert plugin._names_from_label("图片[未识别]") == []
+    assert plugin._names_from_label("图片[]") == []
+    assert plugin._names_from_label("图片[鸣澜]") == ["鸣澜"]
+    assert plugin._names_from_label("图片[阿罗娜（同伴）、普拉娜]") == ["阿罗娜", "普拉娜"]
+
+
+def test_host_resolves_to_public_rejects_unresolvable() -> None:
+    """解析不出也判不可信——无法证明它安全。"""
+    assert imaging.host_resolves_to_public("") is False
+    assert imaging.host_resolves_to_public("this-host-does-not-exist.invalid") is False
 
 
 # ---------------------------------------------------------------- inject
@@ -464,6 +602,26 @@ def test_rescue_fixes_kind_when_name_is_already_in_library() -> None:
     assert "kind" in note
 
 
+def test_status_warns_when_threshold_sits_in_the_jitter_band() -> None:
+    """阈值落在实测波动区间里必须喊出来。
+
+    这是最坏的一种配置：不是一直失败（那会被发现），而是时灵时不灵。真机就出现过
+    0.34 被挡、0.36 通过——同一套卡片、同一张图，差别只是 description 的措辞。
+    """
+    plugin = _plugin_module()
+
+    risky = plugin._fallback_line(plugin.FusionSectionConfig(local_confirm_min_score=0.35))
+    assert "波动区间" in risky and "改成 0" in risky
+
+    safe = plugin._fallback_line(plugin.FusionSectionConfig(local_confirm_min_score=0.25))
+    assert "波动区间" not in safe, "0.25 在波动带下方，不该报"
+
+    off = plugin._fallback_line(plugin.FusionSectionConfig(
+        local_confirm_min_score=0.35, auto_apply_local_confirm=False
+    ))
+    assert "波动区间" not in off, "兜底关掉时阈值不参与判定，不必警告"
+
+
 def test_local_confirm_default_threshold_leaves_room_for_score_jitter() -> None:
     """默认阈值必须给检索分波动留余量，别贴着观测带设。
 
@@ -618,6 +776,10 @@ def test_appearance_cards_are_classified_by_kind() -> None:
         "身穿黑色短抹胸搭配透明外罩衫与灰黄拼色短裙": "服装",
         "白色中筒袜配黑色玛丽珍鞋，鞋面有白色拼接设计": "服装",
         "深蓝色短袖制服配白色立领与蝴蝶结，袖口有金色饰环": "服装",
+        # 真机 09-19 的卡：裸「领」曾把「领结」吃成服装
+        "头戴蓝色蝴蝶结，胸前佩戴黄色领结和绿色圆形徽章": "配饰",
+        "身穿蓝白相间的短款连衣裙，袖口和裙摆有蓝色条纹装饰": "服装",
+        "耳朵佩戴蓝色耳机，耳机带有圆形标识": "配饰",
     }
     for card, expected in cases.items():
         assert textutil.classify_appearance_card(card) == expected, f"{card} → 期望 {expected}"

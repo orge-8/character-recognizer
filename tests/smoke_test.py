@@ -15,6 +15,7 @@
 import ast
 import asyncio
 import base64
+import json
 import sys
 import traceback
 from pathlib import Path
@@ -658,7 +659,10 @@ def check_incremental_card_extraction_gets_existing_cards() -> list[str]:
 
 
 def check_finish_compresses_cards_and_keeps_data_on_failure() -> list[str]:
-    """结束登记时整理一遍：写回是**替换**；整理失败时卡片必须原样不动。"""
+    """结束登记时整理一遍：**在后台跑**、写回是**替换**、失败时卡片原样不动。
+
+    整理是慢活（模型 30~55s），回执不该陪着等——所以它被丢到后台，完成后另发一条通知。
+    """
     failures: list[str] = []
     runner = Runner(config_overrides={"library.admin_ids": ["10001"]})
     asyncio.run(runner.plugin.on_load())
@@ -668,6 +672,13 @@ def check_finish_compresses_cards_and_keeps_data_on_failure() -> list[str]:
             "金色瞳孔", "深蓝色制服上衣", "白色百褶裙", "黑色玛丽珍鞋",
         ]
         admin = {"stream_id": "stream-1", "user_id": "10001"}
+        good = {
+            "success": True, "model": "fake",
+            "response": (
+                '{"appearance_cards":["浅蓝色长发（齐刘海、侧边黑饰）","金色瞳孔",'
+                '"深蓝色制服上衣","白色百褶裙与黑色玛丽珍鞋"]}'
+            ),
+        }
 
         def arm() -> None:
             """把这个角色**重置**成"刚结束一轮登记"的状态。
@@ -681,29 +692,112 @@ def check_finish_compresses_cards_and_keeps_data_on_failure() -> list[str]:
             plugin._pending_additions.clear()
             asyncio.run(plugin.cmd_character_add(**admin, matched_groups={"name": "鸣澜"}))
 
+        def finish() -> str:
+            """跑完结束登记，并等后台整理收尾（真机上事件循环会继续跑，这里要模拟出来）。"""
+
+            async def drive() -> str:
+                reply = await plugin.cmd_character_add_done(**admin)
+                await asyncio.gather(*list(plugin._tasks), return_exceptions=True)
+                return reply[1]
+
+            return asyncio.run(drive())
+
         arm()
-        runner.host.returns["llm.generate"] = {
-            "success": True, "model": "fake",
-            "response": (
-                '{"appearance_cards":["浅蓝色长发（齐刘海、侧边黑饰）","金色瞳孔",'
-                '"深蓝色制服上衣","白色百褶裙与黑色玛丽珍鞋"]}'
-            ),
-        }
-        reply = asyncio.run(plugin.cmd_character_add_done(**admin))
+        runner.host.returns["llm.generate"] = good
+        text = finish()
+        if "已在后台进行" not in text:
+            failures.append(f"回执没有说明整理在后台进行：{text}")
         stored = list(plugin._repository.find_name("鸣澜").appearance_cards)
         if len(stored) != 4:
-            failures.append(f"整理结果没有替换旧卡片：{stored}")
-        if "已合并过同类重复的说法" not in reply[1]:
-            failures.append(f"回执没有说明做过整理：{reply[1]}")
+            failures.append(f"后台整理结果没有替换旧卡片：{stored}")
 
         arm()
         runner.host.returns["llm.generate"] = {
             "success": True, "response": "这不是 JSON", "model": "fake",
         }
-        asyncio.run(plugin.cmd_character_add_done(**admin))
+        finish()
         after = list(plugin._repository.find_name("鸣澜").appearance_cards)
         if after != cards:
             failures.append(f"整理失败时卡片被改动了——绝不允许：{after}")
+
+        # 整理期间用户又补了卡 → 必须放弃本次结果，不能拿旧快照覆盖
+        arm()
+        snapshot = list(plugin._known_cards("鸣澜"))
+        runner.host.returns["llm.generate"] = good
+
+        async def stale() -> None:
+            plugin._repository.append_appearance_cards("鸣澜", ["整理期间新加的卡"])
+            await plugin._compress_and_report("stream-1", "鸣澜", snapshot)
+
+        asyncio.run(stale())
+        after = list(plugin._repository.find_name("鸣澜").appearance_cards)
+        if "整理期间新加的卡" not in after:
+            failures.append(f"整理期间补的卡被旧快照覆盖了：{after}")
+    finally:
+        asyncio.run(runner.plugin.on_unload())
+    return failures
+
+
+def check_llm_calls_carry_explicit_rpc_timeout() -> list[str]:
+    """LLM 调用必须**显式**带 RPC 超时。
+
+    真机踩过：SDK 的 ``ctx.llm.generate`` 转发到 ``cap.call`` 时没传 ``timeout_ms``，于是
+    固定吃 30 秒默认值，而视觉模型实测 54.9s——每次都在 30s 被切断
+    （``RPCError: [E_TIMEOUT] 请求 cap.call 超时 (30000ms)``）。底层 ``call_capability``
+    本身支持覆盖，所以插件必须自己带上。这条守着"别退回裸转发"。
+    """
+    failures: list[str] = []
+    runner = Runner()
+    asyncio.run(runner.plugin.on_load())
+    try:
+        runner.host.reset()
+        asyncio.run(runner.plugin._generate(prompt="ping", task_name="utils"))
+        paired = list(zip(runner.host.calls, runner.host.rpc_timeouts))
+        timeouts = [timeout for (capability, _), timeout in paired if capability == "llm.generate"]
+        if not timeouts:
+            failures.append("llm.generate 没有被调用")
+        elif any(timeout is None for timeout in timeouts):
+            failures.append("llm.generate 没带 RPC 超时，会吃 SDK 的 30s 默认值")
+        elif any(timeout < 60_000 for timeout in timeouts):
+            failures.append(f"RPC 超时太小：{timeouts}")
+    finally:
+        asyncio.run(runner.plugin.on_unload())
+    return failures
+
+
+def check_compress_uses_general_task_not_vision_model() -> list[str]:
+    """整理必须走通用小任务，不能挂在视觉大模型上。
+
+    真机实测：挂在视觉任务上单次 54.9~56.8s，而 Host 的 ``cap.call`` RPC 硬超时只有 **30s**
+    ——插件侧把超时调到 90s 也没用，先断的是 RPC 那一层。所以整理默认走 ``utils``；
+    并且**不能再传视觉模型名**，那会把小任务压回大模型。
+    """
+    failures: list[str] = []
+    runner = Runner(config_overrides={"library.admin_ids": ["10001"]})
+    asyncio.run(runner.plugin.on_load())
+    try:
+        plugin = runner.plugin
+        cards = [f"卡片 {index}" for index in range(10)]
+        plugin._repository.upsert(name="鸣澜", appearance_cards=cards)
+        plugin._pending_additions.clear()
+        admin = {"stream_id": "stream-1", "user_id": "10001"}
+        asyncio.run(plugin.cmd_character_add(**admin, matched_groups={"name": "鸣澜"}))
+
+        runner.host.returns["llm.generate"] = {
+            "success": True, "model": "fake",
+            "response": json.dumps({"appearance_cards": ["甲", "乙", "丙"]}, ensure_ascii=False),
+        }
+        runner.host.reset()
+        asyncio.run(plugin.cmd_character_add_done(**admin))
+
+        calls = [args for name, args in runner.host.calls if name == "llm.generate"]
+        if not calls:
+            failures.append("整理没有发起调用")
+        else:
+            if calls[-1].get("task_name") != "utils":
+                failures.append(f"整理没有走通用小任务：task_name={calls[-1].get('task_name')!r}")
+            if calls[-1].get("model_name"):
+                failures.append("整理不该传视觉模型名，那会把小任务压回大模型")
     finally:
         asyncio.run(runner.plugin.on_unload())
     return failures
@@ -928,6 +1022,8 @@ CHECKS = [
     ("识图修正吃最近图（不需引用）", check_correct_without_reference_uses_recent_images),
     ("抽卡带已有卡片（防重复）", check_incremental_card_extraction_gets_existing_cards),
     ("结束登记整理卡片（失败保原样）", check_finish_compresses_cards_and_keeps_data_on_failure),
+    ("整理走通用小任务（不挂视觉模型）", check_compress_uses_general_task_not_vision_model),
+    ("LLM 调用显式带 RPC 超时", check_llm_calls_carry_explicit_rpc_timeout),
     ("embedding 三种返回形态", check_embedding_degradation_paths),
     ("embed 返回形态解析（batch/single/error）", check_embed_adapter_against_host_shapes),
     ("识别缓存复用", check_vector_cache_reuse),

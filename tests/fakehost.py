@@ -89,6 +89,9 @@ class FakeHost:
         self.returns = dict(self.DEFAULT_RETURNS)
         self.returns.update(returns or {})
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        #: 与 ``calls`` 并行的 RPC 显式超时（None = 吃默认值）。
+        #: 长任务在 30s 被切断（E_TIMEOUT）时，先看这里是不是 None。
+        self.rpc_timeouts: list[int | None] = []
         #: "batch" 返回 ``{"results": [...]}``（默认）；"single" 返回 ``{"embedding": [...]}``；
         #: "error" 模拟 embedding 任务未配置。插件必须同时吃下前两种、优雅处理第三种。
         self.embed_mode = "batch"
@@ -120,6 +123,7 @@ class FakeHost:
         capability = kw.get("capability") or method
         args = kw.get("args") or {}
         self.calls.append((capability, args))
+        self.rpc_timeouts.append(kwargs.get("timeout_ms"))
         if capability == "llm.embed":
             return self._embed_response(args)
         if capability.startswith("send."):
@@ -177,6 +181,7 @@ class FakeHost:
 
     def reset(self) -> None:
         self.calls.clear()
+        self.rpc_timeouts.clear()
 
 
 def _walk_payload(value: Any, path: str = "") -> "list[tuple[str, Any]]":
