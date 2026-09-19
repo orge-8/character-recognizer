@@ -20,13 +20,19 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Sequence
+from urllib.parse import urlsplit
 
 from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParameterInfo, ToolParamType
 
 try:
     from .fusion import FusionOptions, describe_hits, fuse
-    from .imaging import download_image, extract_image_payload, sha256_hex
+    from .imaging import (
+        download_image,
+        extract_image_payload,
+        host_resolves_to_public,
+        sha256_hex,
+    )
     from .inject import apply_injection, apply_rewrite
     from .models import (
         UNRECOGNIZED_LABEL,
@@ -54,7 +60,12 @@ try:
     )
 except ImportError:  # pragma: no cover - Runner 只把目录塞进 sys.path 时走这条
     from fusion import FusionOptions, describe_hits, fuse
-    from imaging import download_image, extract_image_payload, sha256_hex
+    from imaging import (
+        download_image,
+        extract_image_payload,
+        host_resolves_to_public,
+        sha256_hex,
+    )
     from inject import apply_injection, apply_rewrite
     from models import (
         UNRECOGNIZED_LABEL,
@@ -97,6 +108,24 @@ RECENT_IMAGE_LIMIT = 8
 RECENT_IMAGE_SECONDS = 900.0
 #: 保留图片记忆的会话数上限（总字节数另有上限，见 ``_latest_max_bytes``）。
 RECENT_IMAGE_SESSIONS = 64
+
+#: LLM 能力调用的 RPC 超时。Host 的 ``cap.call`` 默认只有 **30s**，而真机视觉模型实测
+#: 要 54.9s——SDK 的 ``ctx.llm.generate`` 转发时**没有传** ``timeout_ms``，于是每次都在
+#: 30s 被切断（``RPCError: [E_TIMEOUT] 请求 cap.call 超时 (30000ms)``）。底层
+#: ``ctx.call_capability`` 是支持覆盖的，所以这里自己带一个够大的值。
+LLM_RPC_TIMEOUT_MS = 180_000
+
+#: 整理外观卡默认用哪个 Host 任务。
+#:
+#: **不能沿用视觉任务**：整理是纯文本活，挂到视觉大模型上实测单次 54.9~56.8s，而 Host 的
+#: ``cap.call`` RPC 硬超时是 **30s**——插件侧把超时调到 90s 也没用，因为先断的是 RPC 那一层。
+#: 换通用小任务才有活路。
+COMPRESS_DEFAULT_TASK = "utils"
+
+#: 检索分的实测波动区间（2026-09-18 真机：同一张图、同一份卡片，分数在 0.34~0.40 之间漂，
+#: 因为 description 由视觉模型每次现生成、措辞一变向量就变）。阈值落进这个区间会表现为
+#: "同一张图时贴时不贴"——比设错更难查，因为它看起来像随机故障。所以状态里要喊出来。
+SCORE_JITTER_BAND = (0.30, 0.42)
 
 
 @dataclass
@@ -188,10 +217,11 @@ class LibrarySectionConfig(PluginConfigBase):
         ),
     )
     compress_task_name: str = Field(
-        default="",
+        default=COMPRESS_DEFAULT_TASK,
         description=(
-            "整理外观卡用的 Host 模型任务名。留空则沿用视觉任务的模型（真机上那样会走视觉大模型，"
-            "实测单次 56.8s）；整理其实是纯文本活，填一个更快的小任务（如 utils）能省不少时间"
+            "整理外观卡用的 Host 模型任务名。**别填成视觉任务**：整理是纯文本活，挂到视觉"
+            f"大模型上实测单次 54.9~56.8s，而 Host 的 cap.call RPC 硬超时只有 30s，必死。"
+            f"默认 {COMPRESS_DEFAULT_TASK}（通用小任务）；填 vlm 可以退回旧行为"
         ),
     )
 
@@ -506,7 +536,20 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
             return False
 
     async def _generate(self, **kwargs: Any) -> dict:
-        """适配 Host 的 llm.generate（vision.py 只认这个形状）。"""
+        """适配 Host 的 llm.generate（vision.py 只认这个形状）。
+
+        **显式带上 RPC 超时**。SDK 的 ``ctx.llm.generate`` 在转发到 ``cap.call`` 时没有传
+        ``timeout_ms``，于是固定吃 30 秒的默认值：真机视觉模型实测 54.9s，必然在 30s 被
+        切断。而底层 ``ctx.call_capability`` 本身支持覆盖——绕开那层封装即可。
+
+        返回形状不变：两条路都过 ``_normalize_capability_result``，``ctx.llm.generate``
+        只额外补了个 ``model`` 别名，而我们全程只读 ``success`` / ``response``。
+        """
+        timeout_ms = int(kwargs.pop("rpc_timeout_ms", LLM_RPC_TIMEOUT_MS))
+        call_capability = getattr(self.ctx, "call_capability", None)
+        if callable(call_capability):
+            return await call_capability("llm.generate", timeout_ms=timeout_ms, **kwargs)
+        # 老 SDK 没有这个方法：退回原封装（会吃 30s 默认超时，但至少还能跑）
         return await self.ctx.llm.generate(**kwargs)
 
     async def _embed_texts(self, texts: "list[str]") -> "list[list[float]] | None":
@@ -982,6 +1025,11 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
             return data, note
         url = str(component.get("url") or "").strip()
         if url.startswith(("http://", "https://")):
+            # 这里先判一次公网，只为**把拒绝原因说清楚**：真正的拦截在 download_image 里
+            # 逐跳做。判两次的代价是多一次 DNS，换来日志能分清"被 SSRF 防护拦下"和
+            # "网络失败"——两者对用户的含义完全不同。
+            if not await asyncio.to_thread(host_resolves_to_public, urlsplit(url).hostname or ""):
+                return None, f"URL 指向非公网地址，已按 SSRF 防护跳过：{url[:80]}"
             downloaded = await asyncio.to_thread(download_image, url, timeout_seconds=15.0)
             if downloaded:
                 return downloaded, "url 下载"
@@ -1580,16 +1628,19 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
             reply = f"「{pending.name}」没建起来（这批图都没抽出可用外观卡），可以重新 /角色添加。"
             return True, reply, 2 if await self._reply(stream_id, reply) else 0
         cards = list(character.appearance_cards)
-        shrunk, note = await self._compress_cards(character.name, cards)
-        if shrunk is not None:
-            cards = shrunk
         reply = (
             f"已结束登记，共收了 {pending.images} 张图。\n"
             + _render_appearance_cards(cards, title=f"「{character.name}」")
-            + ("\n（已合并过同类重复的说法；造型差异与细节保留）" if shrunk is not None
-               else f"\n（未整理：{note}）")
-            + "\n要补卡可再 /角色添加 同名，或发图后 /识图修正"
         )
+        if self.config.library.compress_on_finish:
+            # 整理要跑几十秒（模型 30~55s），不能卡着回执不放。丢后台，完成后另发一条。
+            # 注意这**不解决** cap.call 的 30s RPC 超时——那个限制在宿主侧，放后台一样会断；
+            # 后台化省的是"你要干等 50 秒"，顺带让整理失败不占着命令的返回路径。
+            self._track_task(asyncio.create_task(
+                self._compress_and_report(stream_id, character.name, cards)
+            ))
+            reply += "\n（外观卡整理已在后台进行，完成后会另发一条）"
+        reply += "\n要补卡可再 /角色添加 同名，或发图后 /识图修正"
         return True, reply, 2 if await self._reply(stream_id, reply) else 0
 
     @Command(
@@ -1828,6 +1879,23 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
             raise ValueError("角色库未初始化")
         return self._repository.append_appearance_cards(name, cards)
 
+    async def _compress_and_report(self, stream_id: str, name: str, cards: "list[str]") -> None:
+        """后台整理外观卡，跑完补一条消息。
+
+        整理要几十秒，``/结束角色添加`` 的回执不该陪着等。失败也发一条**简短**通知：
+        不发的话用户会默认整理成功了。
+        """
+        merged, note = await self._compress_cards(name, cards)
+        if merged is None:
+            await self._reply(stream_id, f"「{name}」的外观卡未整理：{note}")
+            return
+        await self._reply(
+            stream_id,
+            f"「{name}」的外观卡整理完成：{len(cards)} → {len(merged)} 条"
+            "（只合并了同类重复的说法，造型差异与细节保留）。\n"
+            + _render_appearance_cards(merged, title=f"「{name}」"),
+        )
+
     async def _cards_from_component(
         self, component: dict, existing: "Sequence[str]" = ()
     ) -> "list[str]":
@@ -1900,13 +1968,24 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
             cards=cards,
             provider=self.config.vision.provider,
             generate=self._generate,
-            # 整理是纯文本活：允许单独指定一个更快的任务，不占用视觉大模型。
-            task_name=self.config.library.compress_task_name or self.config.vision.task_name,
-            model_name=self.config.vision.model_name,
+            # 整理是纯文本活，**不能沿用视觉任务的模型**（实测 54.9~56.8s，而 Host 的
+            # cap.call RPC 硬超时 30s）。配置留空就走 COMPRESS_DEFAULT_TASK。
+            task_name=self.config.library.compress_task_name or COMPRESS_DEFAULT_TASK,
+            model_name="",  # 任务名已经决定了模型；再传视觉模型名会把小任务压回大模型
         )
         if merged is None:
             self._log("info", "外观卡整理未采用：%s", note)
+            if "超时" in note or "E_TIMEOUT" in note:
+                return None, (
+                    f"{note}；该任务上的模型太慢（Host 的 cap.call 硬超时 30s），"
+                    f"可在 library.compress_task_name 换更快的小任务，或关掉 compress_on_finish"
+                )
             return None, note
+        # 整理是慢活：这期间用户完全可能又补了卡（整理在后台跑时尤其如此）。
+        # 快照对不上就放弃——**拿旧结果覆盖新卡片是不可接受的**。
+        if self._known_cards(name) != cards:
+            self._log("info", "外观卡在整理期间被改动，丢弃本次整理结果")
+            return None, "整理期间外观卡被改动，结果已丢弃（现有卡片不受影响）"
         try:
             updated = await self._write(
                 lambda: self._repository.set_appearance_cards(name, merged)
@@ -2013,11 +2092,17 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
 
 
 def _names_from_label(label: str) -> "list[str]":
-    """从 ``图片[角色A（关系）、角色B]`` 里抠出角色名。"""
+    """从 ``图片[角色A（关系）、角色B]`` 里抠出角色名。
+
+    前缀长度按 ``len(prefix)`` 取，别写死数字：这里曾经写成 ``text[4:]``，而 ``"图片["``
+    只有 3 个字符，于是 ``"图片[未识别]"`` 被切出 ``"识别"``——它不等于 ``"未识别"``，
+    就被当成一个角色名去查库了。查不到所以没出事，但"未识别"这条路径等于从未被覆盖过。
+    """
+    prefix = "图片["
     text = str(label or "")
-    if not text.startswith("图片[") or "]" not in text:
+    if not text.startswith(prefix) or "]" not in text:
         return []
-    body = text[4:text.index("]")]
+    body = text[len(prefix):text.index("]")]
     if body == "未识别":
         return []
     names: list[str] = []
@@ -2033,6 +2118,23 @@ def _appearance_summary(cards: "Sequence[str]") -> str:
     groups = group_appearance_cards(cards)
     order = [*CORE_APPEARANCE_CATEGORIES, "配饰", "其他"]
     return "｜".join(f"{name} {len(groups[name])}" for name in order if name in groups)
+
+
+def _fallback_line(config: Any) -> str:
+    """渲染"本地库兜底"这一行，顺手做一次阈值体检。
+
+    为什么要在状态里喊：这个阈值是从"0.55×向量 + 0.35×关键词"的加权和上取的，而那个和会
+    随 description 的措辞漂（实测 0.34~0.40）。**落在这个区间里的阈值是最坏的一种配置**
+    ——不是一直失败（那会被发现），而是时灵时不灵，让人以为是随机故障。所以只要落在区间
+    内就显式警告，并给出建议值。
+    """
+    line = "本地库兜底：" + ("开" if config.auto_apply_local_confirm else "关")
+    line += f"（检索分阈值 {config.local_confirm_min_score}）"
+    low, high = SCORE_JITTER_BAND
+    if config.auto_apply_local_confirm and low <= config.local_confirm_min_score <= high:
+        line += (f"\n  ⚠ 该阈值落在检索分的实测波动区间 {low}~{high} 内："
+                 "同一张图会时贴时不贴。建议改成 0（判据回到「进了候选池 + 视觉模型确认」这对双证）")
+    return line
 
 
 def _render_appearance_cards(cards: "Sequence[str]", title: str = "") -> str:
@@ -2230,8 +2332,7 @@ def _status_lines(config: Any, repository: Any, source_configs: dict, cache_size
             f"{name}{'开' if cfg.enabled else '关'}" for name, cfg in source_configs.items()
         ),
         "单源自动贴标签：" + ("开" if config.fusion.auto_apply_single_source else "关（更安全）"),
-        "本地库兜底：" + ("开" if config.fusion.auto_apply_local_confirm else "关")
-        + f"（检索分阈值 {config.fusion.local_confirm_min_score}）",
+        _fallback_line(config.fusion),
         f"缓存：{cache_size} 条｜向量索引：{index_size} 条｜最近图片记忆：{image_count} 条",
         "向量检索：" + ("可用" if embed_available else "不可用，已降级为关键词检索"),
     ]
