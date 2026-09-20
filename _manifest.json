@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "org.mai-mai.character-recognizer",
-  "version": "1.0.17",
+  "version": "1.0.18",
   "name": "角色识别",
   "description": "识别聊天图片中的二次元角色：复用 MaiBot 内置 VLM 生成描述，用 AnimeTrace 等联网源反查角色出处，并用带相关性检索的本地角色库补充人设与关系知识。角色库支持管理员命令边用边攒，反查结果多源交叉验证后才自动贴标签。",
   "author": {

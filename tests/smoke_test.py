@@ -738,6 +738,58 @@ def check_finish_compresses_cards_and_keeps_data_on_failure() -> list[str]:
     return failures
 
 
+def check_vision_timeout_layering() -> list[str]:
+    """超时要分层，而且要跟得上真实的模型速度。
+
+    背景：真机视觉模型单次 27~53s，而 `image_timeout_seconds` 曾是 25s——识别一半直接超时。
+    建卡/补卡更不该和实时识别共用短超时（那时用户已经预期要等）。
+    另外超时提示必须**可操作**且只出现一次：光说"超时"用户不知道该改哪。
+    """
+    failures: list[str] = []
+    runner = Runner(config_overrides={"library.admin_ids": ["10001"]})
+    asyncio.run(runner.plugin.on_load())
+    try:
+        plugin = runner.plugin
+        conf = plugin.config.plugin
+        if conf.card_timeout_seconds <= conf.image_timeout_seconds:
+            failures.append("建卡超时应当比识别宽松")
+        if conf.image_timeout_seconds < 45:
+            failures.append(f"识别超时盖不住实测的 27~53s：{conf.image_timeout_seconds}")
+
+        # 桩要打在**插件模块自己的命名空间**上：plugin.py 里写的是
+        # `from vision import build_appearance_cards`，它持有自己的引用，
+        # 改 vision 模块的属性对它毫无影响（改了等于没改）。
+        plugin_module = sys.modules.get(type(plugin).__module__)
+        if plugin_module is None or not hasattr(plugin_module, "build_appearance_cards"):
+            failures.append("找不到插件模块里的 build_appearance_cards，无法验证建卡超时")
+        else:
+            seen: list[float] = []
+
+            async def fake_build(**kwargs):
+                seen.append(kwargs.get("timeout_seconds"))
+                return ["甲", "乙"]
+
+            original = plugin_module.build_appearance_cards
+            plugin_module.build_appearance_cards = fake_build
+            try:
+                asyncio.run(plugin._cards_from_bytes(PNG_1PX))
+            finally:
+                plugin_module.build_appearance_cards = original
+            if seen != [conf.card_timeout_seconds]:
+                failures.append(f"建卡没有用 card_timeout_seconds：{seen}")
+
+        first, second = plugin._vision_timeout_hint(), plugin._vision_timeout_hint()
+        if not first:
+            failures.append("超时提示为空")
+        if second:
+            failures.append("超时提示应当只给一次，否则刷屏")
+        if "image_timeout_seconds" not in first:
+            failures.append(f"提示要说明改哪个配置：{first}")
+    finally:
+        asyncio.run(runner.plugin.on_unload())
+    return failures
+
+
 def check_llm_calls_carry_explicit_rpc_timeout() -> list[str]:
     """LLM 调用必须**显式**带 RPC 超时。
 
@@ -1024,6 +1076,7 @@ CHECKS = [
     ("结束登记整理卡片（失败保原样）", check_finish_compresses_cards_and_keeps_data_on_failure),
     ("整理走通用小任务（不挂视觉模型）", check_compress_uses_general_task_not_vision_model),
     ("LLM 调用显式带 RPC 超时", check_llm_calls_carry_explicit_rpc_timeout),
+    ("视觉超时分层与提示", check_vision_timeout_layering),
     ("embedding 三种返回形态", check_embedding_degradation_paths),
     ("embed 返回形态解析（batch/single/error）", check_embed_adapter_against_host_shapes),
     ("识别缓存复用", check_vector_cache_reuse),
