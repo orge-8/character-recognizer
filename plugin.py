@@ -168,7 +168,24 @@ class PluginSectionConfig(PluginConfigBase):
     max_images_per_message: int = Field(default=4, ge=1, le=20, description="单条消息最多识别的图片数")
     max_characters_per_image: int = Field(default=3, ge=1, le=10, description="单图最多保留的角色数")
     max_concurrency: int = Field(default=1, ge=1, le=4, description="视觉与反查的最大并发")
-    image_timeout_seconds: float = Field(default=25.0, ge=3.0, le=120.0, description="单张图片的识别超时")
+    image_timeout_seconds: float = Field(
+        default=50.0,
+        ge=3.0,
+        le=170.0,
+        description=(
+            "单张图片的识别超时。要覆盖得住慢模型——真机实测视觉模型单次 27~53s，"
+            "25s 会让一半识别直接失败。受 message_timeout_seconds 总预算约束"
+        ),
+    )
+    card_timeout_seconds: float = Field(
+        default=90.0,
+        ge=3.0,
+        le=170.0,
+        description=(
+            "建卡 / 补卡时单张图的抽取超时。比识别宽松：那时用户已经预期要等，"
+            "没必要和实时识别共用同一个短超时"
+        ),
+    )
     message_timeout_seconds: float = Field(default=110.0, ge=10.0, le=115.0, description="单条消息的识别总预算")
 
 
@@ -397,6 +414,8 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
         self._lock = asyncio.Lock()
         self._semaphore = asyncio.Semaphore(1)
         self._tasks: set[asyncio.Task] = set()
+        #: 视觉超时的建议每次加载只提示一次——反复刷同一条建议会淹掉别的日志。
+        self._vision_timeout_hinted = False
         #: 会话 → [(图片, 标签, 收到时刻)]，保留最近若干张（见 RECENT_IMAGE_LIMIT）。
         self._latest_images: dict[str, list[tuple[bytes, str, float]]] = {}
         self._latest_bytes = 0
@@ -723,7 +742,8 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
                 max_upload_bytes=cfg.max_upload_bytes,
             )
         except VisionError as exc:
-            self._log("warning", f"图片描述失败：{exc}")
+            hint = self._vision_timeout_hint() if "超时" in str(exc) else ""
+            self._log("warning", f"图片描述失败：{exc}{hint}")
             return ""
 
     async def _identify_candidates(
@@ -757,7 +777,8 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
                 max_upload_bytes=cfg.max_upload_bytes,
             )
         except VisionError as exc:
-            self._log("warning", f"候选校验失败：{exc}")
+            hint = self._vision_timeout_hint() if "超时" in str(exc) else ""
+            self._log("warning", f"候选校验失败：{exc}{hint}")
             return (), f"调用失败：{exc}", ""
         if result is None:
             return (), "模型输出不是可解析的 JSON", ""
@@ -1931,7 +1952,8 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
                 model_name=self.config.vision.model_name,
                 api_key=self.config.vision.api_key,
                 base_url=self.config.vision.base_url,
-                timeout_seconds=self.config.plugin.image_timeout_seconds,
+                # 建卡用更宽松的超时：用户此时已预期要等，不该和实时识别共用短超时。
+                timeout_seconds=self.config.plugin.card_timeout_seconds,
                 max_tokens=self.config.vision.max_tokens,
                 max_upload_bytes=self.config.vision.max_upload_bytes,
                 existing_cards=existing,
@@ -1940,6 +1962,21 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
             self._log("warning", "外观卡抽取失败：%s", exc)
             return []
         return [str(card) for card in cards]
+
+    def _vision_timeout_hint(self) -> str:
+        """视觉请求超时时给一次可操作建议。
+
+        "超时"本身对用户没有指导意义：他不知道该改哪、改成多少。而这件事的根因几乎总是
+        模型太慢（真机实测 50s 级），处理方式只有两条——换快模型，或调大超时。
+        只提示一次，免得刷屏。
+        """
+        if self._vision_timeout_hinted:
+            return ""
+        self._vision_timeout_hinted = True
+        return (
+            f"→ 当前单张超时 {self.config.plugin.image_timeout_seconds:.0f}s；"
+            "该模型单次常超过它。处理方式：换更快的视觉模型，或调大 plugin.image_timeout_seconds"
+        )
 
     def _known_cards(self, name: str) -> "list[str]":
         """取某个角色库里已有的外观卡（给抽卡提示词用）。库不可用时返回空。"""
