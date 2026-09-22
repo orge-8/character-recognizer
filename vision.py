@@ -25,20 +25,22 @@ try:
     from .imaging import prepare_upload, sniff_mime_type
     from .models import VisionCandidate, VisionResult
     from .prompts import (
-    HOST_DESCRIPTION_PROMPT,
-    build_appearance_prompt,
-    build_compress_prompt,
-    build_identify_prompt,
-)
+        HOST_DESCRIPTION_PROMPT,
+        build_appearance_prompt,
+        build_compress_prompt,
+        build_identify_prompt,
+    )
+    from .textutil import CORE_APPEARANCE_CATEGORIES, classify_appearance_card
 except ImportError:  # pragma: no cover - 取决于加载方式
     from imaging import prepare_upload, sniff_mime_type
     from models import VisionCandidate, VisionResult
     from prompts import (
-    HOST_DESCRIPTION_PROMPT,
-    build_appearance_prompt,
-    build_compress_prompt,
-    build_identify_prompt,
-)
+        HOST_DESCRIPTION_PROMPT,
+        build_appearance_prompt,
+        build_compress_prompt,
+        build_identify_prompt,
+    )
+    from textutil import CORE_APPEARANCE_CATEGORIES, classify_appearance_card
 
 #: 注入进来的 Host LLM 调用（plugin.py 负责把 ctx.llm.generate 包成这个形状）
 GenerateFn = Callable[..., Awaitable[dict]]
@@ -50,6 +52,15 @@ DEFAULT_UPLOAD_BYTES = 4_194_304
 APPEARANCE_CARD_LIMIT = 15
 #: 少于这么多条就不值得为"整理"多花一次调用。
 COMPRESS_MIN_CARDS = 8
+
+
+def _covered_kinds(cards: "Sequence[str]") -> "set[str]":
+    """这组卡片覆盖了哪些**核心类别**（发色发型 / 眼睛 / 服装 / 配饰）。
+
+    只看核心类别："其他"是兜底桶，算进来会让覆盖数虚高，反而误杀正常整理。
+    """
+    tracked = set(CORE_APPEARANCE_CATEGORIES) | {"配饰"}
+    return {classify_appearance_card(card) for card in cards} & tracked
 
 
 class VisionError(RuntimeError):
@@ -437,6 +448,16 @@ async def compress_appearance_cards(
         return None, f"整理后只剩 {len(merged)} 条，疑似把造型差异也合掉了，未采用"
     if len(merged) >= len(values):
         return None, f"整理后条数没减少（{len(values)} → {len(merged)}），未采用"
+    # 跨类别合并是**静默的灾难**：真机把 12 条压成 3 条"每张图一条"的大杂烩，每条同时讲
+    # 发色/眼睛/服装，整库只剩"眼睛"一类，连缺口提示都反过来误报缺两类。
+    # 这里用**类别覆盖数**兜底——确定性判据，不依赖模型守规矩。
+    kinds_before, kinds_after = _covered_kinds(values), _covered_kinds(merged)
+    if len(kinds_after) < len(kinds_before):
+        return None, (
+            f"整理后类别覆盖从 {len(kinds_before)} 类降到 {len(kinds_after)} 类"
+            f"（剩：{'、'.join(sorted(kinds_after)) or '无法归类'}），"
+            "疑似把多类特征拼进了同一条，未采用"
+        )
     return merged[:APPEARANCE_CARD_LIMIT], ""
 
 

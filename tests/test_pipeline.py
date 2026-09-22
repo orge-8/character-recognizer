@@ -729,6 +729,83 @@ def test_compress_rejects_suspicious_results() -> None:
     assert merged == ["合并甲", "合并乙", "合并丙"] and note == ""
 
 
+#: 真机 09-22「乐正绫」那轮的 12 条原始卡片（3 类，每类 3~6 条）。
+_LEZHENG_CARDS = [
+    "深棕短发带呆毛，侧边长发编成麻花辫，佩戴红色发箍",
+    "深棕长发带有头顶呆毛，一侧编成长麻花辫垂在身侧",
+    "深棕褐色长发带有呆毛，扎成双马尾，带有卷曲碎刘海",
+    "红棕色眼眸，搭配带有红色坠饰的耳饰",
+    "红棕色眼眸，佩戴红色细发箍和红白色耳机头饰",
+    "红棕色眼眸，佩戴红白色的头戴式耳机",
+    "红白配色的中式改良露肩上衣搭配红色短款裙装",
+    "不对称黑长筒袜搭配红白色翻边短靴并佩戴黑手套",
+    "红白配色露肩短上衣配红色短裙，带有中式盘扣设计",
+    "搭配黑色过膝长袜与红白拼色短靴，配有黑色腰饰",
+    "红白配色露肩短上衣，搭配黑色紧身短裤",
+    "不对称拼色长袜，搭配红白拼色短工装靴",
+]
+
+#: 同一次整理**实际产出**的东西：3 条把发色+眼睛+服装拼在一起的大杂烩。
+_LEZHENG_DEGRADED = [
+    "深棕短发带呆毛侧编麻花辫，戴红色发箍；红棕眼眸配红色坠饰耳饰；红白中式露肩上衣红短裙，配不对称黑长筒袜",
+    "深棕长发带呆毛侧编麻花辫，戴红细发箍+红白耳机；红棕眼眸；红白露肩短上衣红短裙带盘扣，配黑过膝长袜",
+    "深棕褐长发带呆毛双马尾+卷曲碎刘海，戴红白头戴耳机；红棕眼眸；红白露肩短上衣配黑紧身短裤",
+]
+
+
+def _make_generate(payload: dict):
+    async def _generate(**kwargs):
+        return {"success": True, "response": json.dumps(payload, ensure_ascii=False)}
+    return _generate
+
+
+def test_compress_rejects_cross_kind_merge_from_real_incident() -> None:
+    """跨类别合并必须被拦下（真机 09-22 事故的原始数据）。
+
+    那次 12 条被压成 3 条"每张图一条"的大杂烩，每条同时讲发色/眼睛/服装，
+    分类器只能判成"眼睛"，于是整库只剩一类、缺口提示反过来误报缺两类。
+
+    提示词已经写死"一条卡只写一类"，但**模型守不守规矩不能依赖**——这条测的是
+    确定性兜底（类别覆盖数不得下降）。
+    """
+    merged, note = _compress(_LEZHENG_CARDS, _make_generate({"appearance_cards": _LEZHENG_DEGRADED}))
+    assert merged is None, "跨类别退化必须被拒绝"
+    assert "类别覆盖" in note, note
+
+
+def test_compress_allows_same_kind_merge() -> None:
+    """同类合并是正常操作，不能被兜底误杀（否则功能等于关掉）。
+
+    3 条发色发型合成 1 条、类别覆盖不变 → 放行。
+    """
+    before = [
+        "深棕短发带呆毛，配红色发箍",
+        "深棕长发带呆毛，一侧编成麻花辫",
+        "深棕褐色长发，扎成双马尾",
+        "红棕色眼眸，配红色坠饰耳饰",
+        "红棕色眼眸，戴红色细发箍",
+        "红棕色眼眸，戴红白耳机",
+        "红白中式露肩上衣配红色短裙",
+        "不对称黑长筒袜配红白翻边短靴",
+        "红白拼色短靴，配黑色腰饰",
+    ]
+    ok = [
+        "深棕短发或长发带呆毛，配红色发箍或侧编麻花辫",
+        "红棕色眼眸，配红色坠饰耳饰或红白耳机",
+        "红白中式露肩上衣配红色短裙，配不对称黑长筒袜与短靴",
+    ]
+    merged, note = _compress(before, _make_generate({"appearance_cards": ok}))
+    assert merged == ok, note
+    assert note == ""
+
+
+def test_compress_prompt_demands_one_kind_per_card() -> None:
+    """提示词必须点明「一条卡只写一类」——只说"合并同一条特征"会被理解成"每个造型一条"。"""
+    text = prompts.build_compress_prompt(_LEZHENG_CARDS[:3])
+    assert "一条卡片只写一类特征" in text
+    assert "不合格" in text, "要给反例，光有规则模型会按自己的理解走"
+
+
 def test_compress_reports_why_it_did_not_apply() -> None:
     """失败原因必须分开报：超时 / 解析失败 / 调用失败，处理方式完全不同。
 
