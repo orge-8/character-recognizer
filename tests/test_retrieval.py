@@ -293,7 +293,7 @@ def test_only_changed_character_is_re_embedded() -> None:
         ),
     ]
     run(retrieve(updated, query, options=options, embed=stub, index=index))
-    assert stub.calls[-2] == [updated[1].profile_text()], "只应重算画像变了的那个角色"
+    assert stub.calls[-2] == [updated[1].profile_text], "只应重算画像变了的那个角色"
 
 
 def test_prune_drops_removed_characters() -> None:
@@ -343,3 +343,21 @@ def test_build_reverse_confidence_uses_source_count_not_score_sum() -> None:
 def test_build_reverse_confidence_ignores_work_only_sources() -> None:
     hits = [SourceHit("trace_moe", raw_name="", work="火影忍者", confident=True, score=0.95)]
     assert build_reverse_confidence(hits) == {}
+
+
+def test_cosine_accepts_precomputed_norms() -> None:
+    """入库时算好的范数必须与现算结果一致。"""
+    assert cosine([1.0, 0.0], [1.0, 0.0], norm_left=1.0, norm_right=1.0) == 1.0
+    assert cosine([3.0, 4.0], [3.0, 4.0]) == cosine(
+        [3.0, 4.0], [3.0, 4.0], norm_left=5.0, norm_right=5.0
+    )
+
+
+def test_character_derived_fields_are_cached_per_instance() -> None:
+    """profile_text / profile_tokens / normalized_profile 是 cached_property：
+    检索每轮为每个角色各算一次就够，重复访问必须复用同一对象。"""
+    item = character(0, "阿罗娜", "蓝白长发")
+    first = item.profile_text
+    assert item.profile_text is first, "cached_property 必须复用同一对象"
+    assert item.profile_tokens == tokenize(first)
+    assert item.normalized_profile == normalize_name(first)

@@ -53,18 +53,24 @@ class RetrievalOptions:
 
 def content_hash(character: Character) -> str:
     """画像文本摘要。只有它变了才需要重算该角色的向量。"""
-    return hashlib.sha256(character.profile_text().encode("utf-8")).hexdigest()
+    return hashlib.sha256(character.profile_text.encode("utf-8")).hexdigest()
 
 
 class EmbeddingIndex:
     """角色向量的进程内缓存，按 content_hash 失效。"""
 
     def __init__(self) -> None:
-        self._vectors: dict[str, tuple[str, tuple[float, ...]]] = {}
+        #: character_id -> (content_hash, 向量, 向量范数)。范数入库时算一次，
+        #: 不再在每次识别的每次余弦里重算（O(维度) 的纯 Python 循环）。
+        self._vectors: dict[str, tuple[str, tuple[float, ...], float]] = {}
 
     def get(self, character_id: str) -> tuple[float, ...] | None:
         entry = self._vectors.get(character_id)
         return entry[1] if entry else None
+
+    def get_with_norm(self, character_id: str) -> "tuple[tuple[float, ...], float] | None":
+        entry = self._vectors.get(character_id)
+        return (entry[1], entry[2]) if entry else None
 
     def stale(self, characters: Sequence[Character]) -> list[Character]:
         """找出画像已变化或从未算过向量的角色。"""
@@ -76,17 +82,16 @@ class EmbeddingIndex:
         return pending
 
     def put(self, character: Character, vector: Sequence[float]) -> None:
-        self._vectors[character.character_id] = (
-            content_hash(character),
-            tuple(float(value) for value in vector),
-        )
+        values = tuple(float(value) for value in vector)
+        norm = sum(value * value for value in values) ** 0.5
+        self._vectors[character.character_id] = (content_hash(character), values, norm)
 
     def prune(self, valid_ids: set[str]) -> None:
         for character_id in [key for key in self._vectors if key not in valid_ids]:
             del self._vectors[character_id]
 
     def dimensions(self) -> set[int]:
-        return {len(vector) for _, vector in self._vectors.values()}
+        return {len(entry[1]) for entry in self._vectors.values()}
 
     def clear(self) -> None:
         self._vectors.clear()
@@ -95,13 +100,25 @@ class EmbeddingIndex:
         return len(self._vectors)
 
 
-def cosine(left: Sequence[float], right: Sequence[float]) -> float:
-    """余弦相似度，负值截 0（负相关对"是不是这个角色"没有意义）。"""
+def cosine(
+    left: Sequence[float],
+    right: Sequence[float],
+    *,
+    norm_left: float | None = None,
+    norm_right: float | None = None,
+) -> float:
+    """余弦相似度，负值截 0（负相关对"是不是这个角色"没有意义）。
+
+    ``norm_left`` / ``norm_right`` 可传预计算的范数：角色向量的范数在入库时已经
+    算好（见 ``EmbeddingIndex.put``），逐角色打分时不该再各算一遍。
+    """
     if not left or not right or len(left) != len(right):
         return 0.0
     dot = sum(a * b for a, b in zip(left, right))
-    norm_left = sum(a * a for a in left) ** 0.5
-    norm_right = sum(b * b for b in right) ** 0.5
+    if norm_left is None:
+        norm_left = sum(a * a for a in left) ** 0.5
+    if norm_right is None:
+        norm_right = sum(b * b for b in right) ** 0.5
     if not norm_left or not norm_right:
         return 0.0
     return max(0.0, dot / (norm_left * norm_right))
@@ -116,21 +133,20 @@ def name_appears_in(haystack: str, names: Sequence[str]) -> bool:
     normalized = normalize_name(haystack)
     if not normalized:
         return False
-    for name in names:
-        candidate = normalize_name(name)
+    return _name_in_normalized(normalized, [normalize_name(name) for name in names])
+
+
+def _name_in_normalized(normalized_haystack: str, normalized_names: Sequence[str]) -> bool:
+    """归一后的包含判定。热路径专用：两侧都已归一，不再逐角色逐 haystack 做 NFKC。"""
+    for candidate in normalized_names:
         if not candidate:
             continue
-        if candidate == normalized:
+        if candidate == normalized_haystack:
             return True
         threshold = 4 if candidate.isascii() else 2
-        if len(candidate) >= threshold and candidate in normalized:
+        if len(candidate) >= threshold and candidate in normalized_haystack:
             return True
     return False
-
-
-def _any_name_in(character: Character, haystacks: Sequence[str]) -> bool:
-    names = character.all_names
-    return any(name_appears_in(haystack, names) for haystack in haystacks if haystack)
 
 
 async def retrieve(
@@ -161,6 +177,15 @@ async def retrieve(
     query_text = query.compose()
     query_tokens = tokenize(query_text)
     normalized_reverse = {normalize_name(name): float(weight) for name, weight in reverse_confidence.items()}
+    # haystack 的 NFKC 归一每次检索只做一次，不再逐角色重复（原为 角色数 × haystack 数 次）
+    normalized_haystacks = [
+        value
+        for value in (
+            normalize_name(text)
+            for text in (*query.reverse_names, *query.evidence, query.description)
+        )
+        if value
+    ]
 
     # ---- pinned：被反查源点名的角色无条件入选
     weighted_pinned: list[tuple[float, ScoredCharacter]] = []
@@ -199,6 +224,7 @@ async def retrieve(
 
     pinned_ids = {item.character.character_id for item in pinned}
     active_index = index if query_vector else None
+    query_norm = sum(value * value for value in query_vector) ** 0.5 if query_vector else 0.0
 
     scored: list[ScoredCharacter] = []
     for character in characters:
@@ -209,7 +235,9 @@ async def retrieve(
             query=query,
             query_tokens=query_tokens,
             normalized_reverse=normalized_reverse,
+            normalized_haystacks=normalized_haystacks,
             query_vector=query_vector,
+            query_norm=query_norm,
             index=active_index,
             options=options,
             degraded=degraded,
@@ -256,7 +284,7 @@ async def _prepare_vectors(
 
     for offset in range(0, len(stale), size):
         chunk = stale[offset:offset + size]
-        vectors = await _safe_embed(embed, [item.profile_text() for item in chunk])
+        vectors = await _safe_embed(embed, [item.profile_text for item in chunk])
         if vectors is None or len(vectors) != len(chunk):
             return (), True
         if len({len(vector) for vector in vectors}) != 1:
@@ -300,18 +328,21 @@ def _score(
     query: Query,
     query_tokens: frozenset[str],
     normalized_reverse: Mapping[str, float],
+    normalized_haystacks: Sequence[str],
     query_vector: tuple[float, ...],
+    query_norm: float,
     index: EmbeddingIndex | None,
     options: RetrievalOptions,
     degraded: bool,
 ) -> tuple[float, tuple[str, ...]]:
     """单角色打分，返回 ``(分数, 命中理由)``。"""
-    profile = character.profile_text()
-    normalized_profile = normalize_name(profile)
-    haystacks = [*query.reverse_names, *query.evidence, query.description]
+    # 派生数据走 Character 的 cached_property：画像拼接 / NFKC 归一 / 分词
+    # 对同一实例只做一次，不再逐角色逐次识别重复。
+    normalized_profile = character.normalized_profile
 
     # T1 精确命中：描述/证据里直接写了这个名字（含别名）
-    if _any_name_in(character, haystacks):
+    normalized_names = [normalize_name(name) for name in character.all_names]
+    if any(_name_in_normalized(haystack, normalized_names) for haystack in normalized_haystacks):
         return 1.0, ("名字精确命中",)
 
     # 反查源用的名字能解析到该角色（跨语言写法的情形）
@@ -324,7 +355,7 @@ def _score(
         normalize_name(work) == normalize_name(character.work) for work in query.reverse_works if work
     )
 
-    keyword_score = overlap_score(query_tokens, tokenize(profile))
+    keyword_score = overlap_score(query_tokens, character.profile_tokens)
     reasons: list[str] = []
     if keyword_score >= options.keyword_min_score:
         reasons.append(f"关键词 {keyword_score:.2f}")
@@ -338,8 +369,12 @@ def _score(
             reasons.append("反查名字可解析到该角色")
         return (min(1.0, base), tuple(reasons)) if base > 0 else (0.0, ())
 
-    character_vector = index.get(character.character_id)
-    embed_score = cosine(query_vector, character_vector) if character_vector else 0.0
+    entry = index.get_with_norm(character.character_id)
+    embed_score = (
+        cosine(query_vector, entry[0], norm_left=query_norm, norm_right=entry[1])
+        if entry
+        else 0.0
+    )
     if embed_score >= options.embed_min_score:
         reasons.append(f"向量 {embed_score:.2f}")
 

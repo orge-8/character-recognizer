@@ -748,18 +748,20 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
 
     async def _identify_candidates(
         self, image_bytes: bytes, catalog: "list[dict]"
-    ) -> "tuple[tuple[str, ...], str, str]":
+    ) -> "tuple[tuple[str, ...], str, str, str]":
         """用带本地库目录的提示词做一次候选校验。
 
-        返回 ``(候选名, 说明, 模型原始输出)``。后两项是给排障用的——**"没有可用候选"
+        返回 ``(候选名, 说明, 模型原始输出, 模型给出的图片描述)``。最后一项供视觉调用
+        合并路径复用（identify 的 JSON 本就带 description，不必再单跑一趟 describe）。
+        中间两项是给排障用的——**"没有可用候选"
         下面藏着四种完全不同的原因**（模型没给候选 / 判定不在库内 / 带了冲突特征 /
         证据不足），处理方式各不相同。只报一句"未确认"，用户会去改没错的那一环。
         """
         cfg = self.config.vision
         if not cfg.enabled:
-            return (), "视觉通道已关闭", ""
+            return (), "视觉通道已关闭", "", ""
         if not catalog:
-            return (), "没有可校验的本地候选", ""
+            return (), "没有可校验的本地候选", "", ""
         try:
             result = await identify_image(
                 provider=cfg.provider,
@@ -779,9 +781,9 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
         except VisionError as exc:
             hint = self._vision_timeout_hint() if "超时" in str(exc) else ""
             self._log("warning", f"候选校验失败：{exc}{hint}")
-            return (), f"调用失败：{exc}", ""
+            return (), f"调用失败：{exc}", "", ""
         if result is None:
-            return (), "模型输出不是可解析的 JSON", ""
+            return (), "模型输出不是可解析的 JSON", "", ""
         # 模型的格式自觉不可靠（真机出现过"证据逐字抄了库内画像，却把 kind 标成 unknown"），
         # 所以再用确定性比对兜一次。
         result, rescue_note = rescue_unlabeled_candidates(result, catalog)
@@ -790,7 +792,7 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
             note = "确认了候选" + (f"；{rescue_note}" if rescue_note else "")
         else:
             note = f"无可用候选（{describe_vision_dropouts(result)}）"
-        return names, note, result.raw
+        return names, note, result.raw, result.description
 
     # ---------------------------------------------------------- 识别主流程
 
@@ -855,15 +857,29 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
         # 真值判断会踩坑：空库的 bool() 是 False，语义上会被当成"没有库"。
         characters = tuple(self._repository.characters) if self._repository is not None else ()
 
-        # 阶段一：反查源与图片描述并行，互不依赖
-        (hits, errors), description = await asyncio.gather(
-            self._collect_hits(image_bytes),
-            self._describe(image_bytes),
+        # 阶段一：先跑反查，再决定要不要独立的图片描述调用。
+        #
+        # 反查给出角色名信号且融合尚未确认时，describe 与 identify 两次视觉调用合并成
+        # 一次：identify 的输出本就含 description 字段（见 prompts 的 JSON 格式），让它
+        # 一趟把"描述 + 候选校验"都做了，省下一整趟 30~50s 的视觉调用。这条路径上检索
+        # 查询以反查名为主（Query.compose 里反查名重复加权），且被点名的角色有 pinned
+        # 保底，检索失去描述文本的影响可控。
+        hits, errors = await self._collect_hits(image_bytes)
+        preliminary = fuse(hits, resolve=self._resolver(), options=self._fusion_options())
+        merged_vision = (
+            self.config.vision.enabled
+            and bool(characters)
+            and self.config.library.enabled
+            and any(hit.gives_character for hit in hits)
+            and preliminary.tier != TIER_CONFIRMED
         )
+        if merged_vision:
+            description = ""
+        else:
+            description = await self._describe(image_bytes)
         diag["characters"] = len(characters)
         diag["reverse"] = f"命中 {len(hits)} 条" if hits else "无命中"
         diag["reverse_errors"] = list(errors)
-        diag["description"] = bool(description)
         if errors:
             self._log("warning", "部分反查源失败：%s", "；".join(errors))
         if self.config.plugin.debug and hits:
@@ -908,7 +924,6 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
         vision_note = "未调用"
         vision_raw = ""
         if retrieval is not None and retrieval.selected and self.config.vision.enabled:
-            preliminary = fuse(hits, resolve=self._resolver(), options=self._fusion_options())
             if preliminary.tier != TIER_CONFIRMED:
                 catalog = [
                     {
@@ -921,11 +936,21 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
                     }
                     for item in retrieval.selected
                 ]
-                vision_names, vision_note, vision_raw = await self._identify_candidates(image_bytes, catalog)
+                vision_names, vision_note, vision_raw, vision_description = await self._identify_candidates(
+                    image_bytes, catalog
+                )
+                if merged_vision:
+                    # 合并路径：这一次视觉调用同时承担"描述"职责；没产出描述才补一趟
+                    description = vision_description
+                    if not description:
+                        description = await self._describe(image_bytes)
             else:
                 vision_note = "未调用（反查源已确认，不需要校验）"
         elif retrieval is not None:
             vision_note = "未调用（检索没有选出候选）"
+            if merged_vision:
+                # 检索没选出候选时 identify 不会跑，描述得补回来
+                description = await self._describe(image_bytes)
         diag["vision"] = vision_note
         diag["vision_names"] = list(vision_names)
         diag["vision_raw"] = vision_raw
@@ -951,6 +976,7 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
         diag["tier"] = fusion.tier
         diag["label"] = label
         diag["reason"] = fusion.reason
+        diag["description"] = bool(description)
         self._last_diagnosis = diag
         injection = ""
         if self.config.injection.enabled and (retrieval is not None or fusion.works):
@@ -1081,16 +1107,15 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
         带 ``limit`` 是为了让只要一张的调用方（工具）不必把整条消息的图全下载下来——
         ``_message_image`` 就是 ``limit=1`` 的用法。
         """
-        images: "list[bytes]" = []
-        for component in await self._message_components(message_id):
-            if len(images) >= max(1, limit):
-                break
-            if component.get("type") != "image":
-                continue
-            data, _ = await self._resolve_image(component)
-            if data:
-                images.append(data)
-        return images
+        cap = max(1, limit)
+        components = [
+            component
+            for component in await self._message_components(message_id)
+            if component.get("type") == "image"
+        ][:cap]
+        # 多张图并发解析（base64 解码 / URL 下载），不再串行等待
+        resolved = await asyncio.gather(*(self._resolve_image(component) for component in components))
+        return [data for data, _ in resolved if data]
 
     async def _message_image(self, message_id: str) -> bytes | None:
         """按消息 ID 取引用消息里的**第一张**图（供返回单个识别结论的工具用）。"""
@@ -1183,8 +1208,12 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
         limit = self.config.plugin.max_images_per_message
         generation = self._generation
         tasks: list[asyncio.Task] = []
+        #: 与 tasks 对齐的已解析图片字节，识别完成后直接复用——同一张图不解析第二次
+        #: （base64 解码是 CPU 活；URL 来源的图再解析一次等于再下载一遍）。
+        resolved: "list[bytes | None]" = []
         for component in images[:limit]:
             image_bytes, note = await self._resolve_image(component)
+            resolved.append(image_bytes)
             if image_bytes is None:
                 self._log("warning", "图片载荷不可用：%s", note)
                 tasks.append(asyncio.create_task(self._noop_result()))
@@ -1215,7 +1244,7 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
             if result is None or not result.ok:
                 replacements.append([component])
                 continue
-            image_bytes, _ = await self._resolve_image(component)
+            image_bytes = resolved[index]
             if image_bytes:
                 self._remember_image(key, image_bytes, result.label)
             if result.description:
@@ -1734,7 +1763,7 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
         except Exception as exc:
             reply = f"修正失败：{exc}"
             return True, reply, 2 if await self._reply(stream_id, reply) else 0
-        self._index.clear()
+        # 向量索引按 content_hash 增量失效（retrieval 的 stale/prune），单角色变更不必全清
         reply = (
             f"从 {len(images)} 张图里为「{updated.name}」补充了 {len(cards)} 条"
             + (f"（{failed} 张没抽到卡）" if failed else "")
@@ -1842,7 +1871,7 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
         except ValueError as exc:
             reply = str(exc)
             return True, reply, 2 if await self._reply(stream_id, reply) else 0
-        self._index.clear()
+        # 已删角色的向量由 retrieval 的 prune 在下一次检索时清除，不必全清
         reply = f"已删除角色「{removed.name}」。" if removed else "删除失败。"
         return True, reply, 2 if await self._reply(stream_id, reply) else 0
 
@@ -2030,7 +2059,7 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
         except (ValueError, RuntimeError) as exc:
             self._log("warning", "外观卡整理写回失败，保持原样：%s", exc)
             return None, f"写回失败：{exc}"
-        self._index.clear()
+        # 向量索引按 content_hash 增量失效，不必全清
         return list(updated.appearance_cards), ""
 
     async def _collect_character_images(
@@ -2079,7 +2108,7 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
             self._pending_additions.pop(self._pending_key(message), None)
             await self._reply(stream_id, f"角色未收录：{exc}（登记已结束）")
             return
-        self._index.clear()
+        # 向量索引按 content_hash 增量失效，不必全清
         pending.touched()
         pending.images += len(batch)
         stored = list(saved.appearance_cards)
@@ -2120,7 +2149,7 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
         except ValueError as exc:
             reply = str(exc)
             return True, reply, 2 if await self._reply(stream_id, reply) else 0
-        self._index.clear()
+        # 向量索引按 content_hash 增量失效，不必全清
         reply = f"已更新「{name}」的{label}。"
         return True, reply, 2 if await self._reply(stream_id, reply) else 0
 

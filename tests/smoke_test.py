@@ -1056,6 +1056,80 @@ def check_vector_cache_reuse() -> list[str]:
     return failures
 
 
+def check_library_write_keeps_vector_index() -> list[str]:
+    """角色库写操作后向量索引必须保留——增量失效由 content_hash 负责。
+
+    这是"写后全清索引"的回归网：若有人把 ``self._index.clear()`` 加回写路径，
+    下一次识别就要全库重取向量（每 32 条一次 RPC），这条检查会立刻失败。
+    """
+    failures: list[str] = []
+    runner = Runner(config_overrides={"vision.enabled": False})
+    asyncio.run(runner.plugin.on_load())
+    try:
+        character = runner.plugin._repository.upsert(name="阿罗娜", appearance_cards=["蓝白长发"])
+        runner.plugin._index.put(character, [1.0] * 8)
+        # 必须走插件命令路径（_field_command）：索引清理挂在插件层而不是 repository 层，
+        # 直调 repository 会让这条检查永远通过、失去回归意义。
+        asyncio.run(runner.plugin._field_command(
+            {"is_local_operator": True, "matched_groups": {"name": "阿罗娜", "value": "来自基沃托斯"}},
+            "persona", "设定",
+        ))
+        if len(runner.plugin._index) != 1:
+            failures.append("写操作后向量索引被全量清空，增量失效被破坏")
+    finally:
+        asyncio.run(runner.plugin.on_unload())
+    return failures
+
+
+def check_merged_vision_call() -> list[str]:
+    """反查有角色名但未确认时，describe + identify 应合并成一次视觉调用。
+
+    identify 的输出本就带 description 字段，这条路径上独立 describe 是白跑一趟
+    30~50s 的视觉调用。合并后：视觉只调一次，消息描述来自 identify 的输出。
+    """
+    failures: list[str] = []
+    payload_json = json.dumps({
+        "description": "蓝白长发的女孩站在教室里",
+        "is_anime_character": True,
+        "candidates": [{
+            "kind": "private", "name": "阿罗娜", "work": "蔚蓝档案",
+            "evidence": ["蓝白长发", "发光圆环"], "conflicts": [],
+        }],
+    }, ensure_ascii=False)
+    runner = Runner(
+        config_overrides={"anime_trace.enabled": True},
+        returns={
+            "llm.generate": {"success": True, "response": payload_json, "model": "fake-model"},
+        },
+    )
+    import sources as sources_module
+
+    async def stub(image_bytes, config):
+        from models import SourceHit
+        return (SourceHit("anime_trace", raw_name="阿罗娜", work="蔚蓝档案", confident=True),)
+
+    original = dict(sources_module.ADAPTERS)
+    sources_module.ADAPTERS.update({"anime_trace": stub})
+    try:
+        asyncio.run(runner.plugin.on_load())
+        runner.plugin._repository.upsert(
+            name="阿罗娜", work="蔚蓝档案", appearance_cards=["蓝白长发", "发光圆环"]
+        )
+        result = asyncio.run(runner.plugin._recognize(PNG_1PX))
+    finally:
+        sources_module.ADAPTERS.clear()
+        sources_module.ADAPTERS.update(original)
+
+    vision_calls = runner.host.calls_of("llm.generate")
+    if len(vision_calls) != 1:
+        failures.append(f"合并路径应只跑 1 次视觉调用，实际 {len(vision_calls)} 次")
+    if result.description != "蓝白长发的女孩站在教室里":
+        failures.append(f"合并路径的描述应来自 identify 输出，实际 {result.description!r}")
+    if "阿罗娜" not in result.label:
+        failures.append(f"反查点名 + 视觉确认应贴出标签，实际 {result.label!r}")
+    return failures
+
+
 CHECKS = [
     ("自调方法都有定义（防漏改）", check_no_undefined_self_calls),
     ("组件清单（数量/类型/处理器名）", lambda: check_component_inventory(_shared_runner())),
@@ -1080,6 +1154,8 @@ CHECKS = [
     ("embedding 三种返回形态", check_embedding_degradation_paths),
     ("embed 返回形态解析（batch/single/error）", check_embed_adapter_against_host_shapes),
     ("识别缓存复用", check_vector_cache_reuse),
+    ("写操作后向量索引保留（增量失效）", check_library_write_keeps_vector_index),
+    ("反查未确认时视觉调用合并为一次", check_merged_vision_call),
     ("卸载清理", check_unload_cleans_up),
 ]
 
