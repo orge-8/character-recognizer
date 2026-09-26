@@ -7,6 +7,7 @@ AnimeTrace 对上传体积有硬限制（超限直接 HTTP 413，官方没写具
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
@@ -15,6 +16,11 @@ import socket
 import urllib.error
 import urllib.request
 from urllib.parse import urljoin, urlsplit
+
+try:  # Runner 可能按包加载，也可能只把目录塞进 sys.path
+    from .runtime import TTLCache
+except ImportError:  # pragma: no cover - 取决于加载方式
+    from runtime import TTLCache
 
 #: 逐级缩小的边长阶梯 + 逐级下调的 JPEG 质量。
 #: 两层阶梯一起走，才能保证高熵截图（PNG 截图、噪点图）也压得下来，
@@ -93,7 +99,16 @@ def prepare_upload(
     except Exception as exc:
         raise ValueError(f"图片无法解析，无法压缩上传：{exc}") from exc
 
-    for edge in edge_ladder:
+    # 按体积比预估起始档位，跳过注定压不下的高档位（每档都要再乘一串 JPEG 编码）。
+    # 阈值刻意保守：压得不太狠时第一档往往就够，提前缩小只会白丢画质。
+    ratio = len(image_bytes) / max(1, max_bytes)
+    if ratio > 10:
+        ladder = edge_ladder[2:]
+    elif ratio > 4:
+        ladder = edge_ladder[1:]
+    else:
+        ladder = edge_ladder
+    for edge in ladder:
         candidate = original.copy()
         candidate.thumbnail((edge, edge))
         for quality in quality_ladder:
@@ -103,6 +118,53 @@ def prepare_upload(
             if len(result) <= max_bytes:
                 return result, "image/jpeg"
     raise ValueError(f"图片压缩后仍超过上传上限 {max_bytes} 字节")
+
+
+#: 压缩副本的进程内缓存。同一张图在一次识别里会被多个上传方各要一份（反查源 / 描述 /
+#: 候选校验的体积上限不同），按 (内容哈希, 上限) 记忆化后每档只压一次。
+_UPLOAD_CACHE: "TTLCache | None" = None
+
+
+def _upload_cache() -> TTLCache:
+    global _UPLOAD_CACHE
+    if _UPLOAD_CACHE is None:
+        _UPLOAD_CACHE = TTLCache(max_entries=32, ttl_seconds=3600.0)
+    return _UPLOAD_CACHE
+
+
+async def prepare_upload_async(
+    image_bytes: bytes,
+    *,
+    max_bytes: int,
+    edge_ladder: tuple[int, ...] = EDGE_LADDER,
+    quality_ladder: tuple[int, ...] = QUALITY_LADDER,
+) -> tuple[bytes, str]:
+    """``prepare_upload`` 的异步 + 记忆化版本。
+
+    两件事一起解决：
+
+    * Pillow 缩放/编码是同步 CPU 重活，放 ``asyncio.to_thread``，不堵事件循环；
+    * 同一张图的同一档上限只压一次（见 ``_UPLOAD_CACHE``）。
+
+    纪律不变：压缩副本只用于上传，不进识别缓存键。
+    """
+    if not image_bytes:
+        raise ValueError("图片内容为空")
+    if len(image_bytes) <= max_bytes:
+        return image_bytes, sniff_mime_type(image_bytes)
+    cache_key = f"{sha256_hex(image_bytes)}:{max_bytes}"
+    cached = _upload_cache().get(cache_key)
+    if cached is not None:
+        return cached
+    result = await asyncio.to_thread(
+        prepare_upload,
+        image_bytes,
+        max_bytes=max_bytes,
+        edge_ladder=edge_ladder,
+        quality_ladder=quality_ladder,
+    )
+    _upload_cache().put(cache_key, result)
+    return result
 
 
 def extract_image_payload(component: object) -> tuple[bytes | None, str]:

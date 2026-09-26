@@ -289,7 +289,7 @@ class CharacterRepository:
         matched = [
             character
             for character in self._characters
-            if key in normalize_name(character.profile_text())
+            if key in character.normalized_profile
             or any(key in normalize_name(item) for item in character.all_names)
         ]
         return tuple(matched[:limit])

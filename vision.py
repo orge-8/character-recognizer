@@ -22,7 +22,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 try:
-    from .imaging import prepare_upload, sniff_mime_type
+    from .imaging import prepare_upload_async, sniff_mime_type
     from .models import VisionCandidate, VisionResult
     from .prompts import (
         HOST_DESCRIPTION_PROMPT,
@@ -32,7 +32,7 @@ try:
     )
     from .textutil import CORE_APPEARANCE_CATEGORIES, classify_appearance_card
 except ImportError:  # pragma: no cover - 取决于加载方式
-    from imaging import prepare_upload, sniff_mime_type
+    from imaging import prepare_upload_async, sniff_mime_type
     from models import VisionCandidate, VisionResult
     from prompts import (
         HOST_DESCRIPTION_PROMPT,
@@ -93,7 +93,7 @@ async def generate_with_host(
     别名（如 ``vlm``），后者是具体模型名。两者都只在非空时才传，否则会去查一个不存在
     的模型并直接失败。
     """
-    upload, _ = prepare_upload(image_bytes, max_bytes=max_upload_bytes)
+    upload, _ = await prepare_upload_async(image_bytes, max_bytes=max_upload_bytes)
     kwargs: dict[str, Any] = {
         "prompt": [{"role": "user", "content": [
             {"type": "text", "text": prompt},
@@ -538,7 +538,7 @@ async def _call_direct(
     temperature: float,
     max_upload_bytes: int,
 ) -> str:
-    upload, _ = prepare_upload(image_bytes, max_bytes=max_upload_bytes)
+    upload, _ = await prepare_upload_async(image_bytes, max_bytes=max_upload_bytes)
     if provider == "gemini":
         url = base_url.rstrip("/") + f"/models/{model_name}:generateContent?key={api_key}"
         payload = {

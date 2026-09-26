@@ -20,11 +20,11 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 try:
-    from .imaging import prepare_upload
+    from .imaging import prepare_upload_async
     from .models import SourceHit
     from .textutil import clean_display_name, is_plausible_name
 except ImportError:  # pragma: no cover - 取决于加载方式
-    from imaging import prepare_upload
+    from imaging import prepare_upload_async
     from models import SourceHit
     from textutil import clean_display_name, is_plausible_name
 
@@ -182,7 +182,7 @@ def parse_anime_trace(payload: dict[str, Any], *, max_candidates: int = 3) -> tu
 
 async def search_anime_trace(image_bytes: bytes, config: SourceConfig) -> tuple[SourceHit, ...]:
     try:
-        upload, mime_type = prepare_upload(image_bytes, max_bytes=config.max_upload_bytes)
+        upload, mime_type = await prepare_upload_async(image_bytes, max_bytes=config.max_upload_bytes)
     except ValueError as exc:
         raise SourceError(f"图片无法压到上传上限：{exc}", transient=False) from exc
     body, boundary = _multipart(upload, mime_type)
@@ -240,16 +240,16 @@ async def run_source(
 
 # ---------------------------------------------------------------- 原始探测（用于先验证再写）
 
-def _probe_request(config: SourceConfig, image_bytes: bytes) -> tuple[str, bytes, str]:
+async def _probe_request(config: SourceConfig, image_bytes: bytes) -> tuple[str, bytes, str]:
     """按各源已知的请求形态构造一次原始探测请求。"""
     if config.name == "saucenao":
-        upload, mime_type = prepare_upload(image_bytes, max_bytes=config.max_upload_bytes)
+        upload, mime_type = await prepare_upload_async(image_bytes, max_bytes=config.max_upload_bytes)
         body, boundary = _multipart(upload, mime_type)
         # SauceNAO 需要把 key / output_type 放在 query string 上
         query = f"key={config.api_key}&output_type=2&numres={max(1, config.max_candidates)}&db=999"
         return f"{config.url.rstrip('/')}/search.php?{query}", body, f"multipart/form-data; boundary={boundary}"
     if config.name == "trace_moe":
-        upload, mime_type = prepare_upload(image_bytes, max_bytes=config.max_upload_bytes)
+        upload, mime_type = await prepare_upload_async(image_bytes, max_bytes=config.max_upload_bytes)
         body, boundary = _multipart(upload, mime_type, field="image")
         return f"{config.url.rstrip('/')}/search?anilistInfo=1", body, f"multipart/form-data; boundary={boundary}"
     raise SourceError(f"没有 {config.name} 的探测请求构造器")
@@ -262,7 +262,7 @@ async def probe_endpoint(config: SourceConfig, image_bytes: bytes) -> dict[str, 
     ``characters`` 字段到底有多稀疏。所以这里刻意只报顶层字段名与条目数。
     """
     try:
-        url, body, content_type = _probe_request(config, image_bytes)
+        url, body, content_type = await _probe_request(config, image_bytes)
         payload = await asyncio.to_thread(_post, url, body, content_type, config.timeout_seconds)
     except SourceError as exc:
         return {"ok": False, "error": str(exc)}

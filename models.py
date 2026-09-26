@@ -4,7 +4,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import cached_property
 from typing import Any
+
+try:  # Runner 可能按包加载，也可能只把目录塞进 sys.path
+    from .textutil import normalize_name, tokenize
+except ImportError:  # pragma: no cover - 取决于加载方式
+    from textutil import normalize_name, tokenize
 
 # 只有这两个源会给出**角色名**，"角色源"集合决定了 agreement 怎么算。
 CHARACTER_SOURCES = frozenset({"anime_trace", "saucenao"})
@@ -67,10 +73,16 @@ class Character:
     def all_works(self) -> tuple[str, ...]:
         return tuple(item for item in (self.work, *self.work_aliases) if item)
 
+    @cached_property
     def profile_text(self) -> str:
         """用于向量与关键词检索的完整画像文本。
 
         顺序刻意把最能区分身份的内容放前面：截断时丢的是外观卡而不是名字。
+
+        用 ``cached_property`` 而不是方法：检索在每次识别里要为**每个角色**拼这段
+        文本、做 NFKC 归一和分词，而 Character 是 frozen 的——派生结果只随实例变。
+        ``cached_property`` 直接写实例 ``__dict__``，不经 ``__setattr__``，不破坏
+        frozen 语义；库重载会重建实例，缓存自然随之失效。
         """
         parts = [self.name]
         if self.aliases:
@@ -86,6 +98,16 @@ class Character:
         if self.appearance_cards:
             parts.append("外观：" + "；".join(self.appearance_cards))
         return "\n".join(parts)
+
+    @cached_property
+    def profile_tokens(self) -> frozenset[str]:
+        """``profile_text`` 的分词结果。检索打分的逐角色重复计算大头。"""
+        return tokenize(self.profile_text)
+
+    @cached_property
+    def normalized_profile(self) -> str:
+        """``profile_text`` 的归一形态。反查名解析与精确命中的逐角色重复计算。"""
+        return normalize_name(self.profile_text)
 
     @classmethod
     def from_dict(cls, raw: Any) -> "Character | None":
