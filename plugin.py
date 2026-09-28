@@ -51,6 +51,7 @@ try:
     from .textutil import CORE_APPEARANCE_CATEGORIES, group_appearance_cards
     from .vision import (
         VisionError,
+        VisionOutputError,
         build_appearance_cards,
         describe_image,
         compress_appearance_cards,
@@ -84,6 +85,7 @@ except ImportError:  # pragma: no cover - Runner 只把目录塞进 sys.path 时
     from textutil import CORE_APPEARANCE_CATEGORIES, group_appearance_cards
     from vision import (
         VisionError,
+        VisionOutputError,
         build_appearance_cards,
         describe_image,
         compress_appearance_cards,
@@ -121,6 +123,47 @@ LLM_RPC_TIMEOUT_MS = 180_000
 #: ``cap.call`` RPC 硬超时是 **30s**——插件侧把超时调到 90s 也没用，因为先断的是 RPC 那一层。
 #: 换通用小任务才有活路。
 COMPRESS_DEFAULT_TASK = "utils"
+
+#: 视觉请求的 ``max_tokens`` **运行期下限**。
+#:
+#: 真机实录（09-28）：`describe` 走默认 220 触顶、`identify` 按配置的 700 也触顶，两次都是
+#: "达到最大输出 token 限制"。要注意**推理模型的思考 token 也算在这个上限里**，所以
+#: "描述最多 100 字 + 3 个候选"这种看起来几百 token 就够的输出，700 照样会被截断。
+#:
+#: 截断的代价是**静默失败**：JSON 断在 evidence 中途 → 整条候选校验作废，用户只看到
+#: "识别没结果"。而多留上限不会多花钱（只按实际输出计费），所以这里设一个下限兜底，
+#: 用户真机已有的 ``max_tokens = 700`` 不必改配置就能生效。
+VISION_MAX_TOKENS_FLOOR = 1600
+
+#: 单图超时最多只能占整条消息预算的这个比例。**必须严格小于 1**。
+#:
+#: 真机踩过的不变量破坏：用户照着插件自己的提示把 ``image_timeout_seconds`` 调到了 120，
+#: 而 ``message_timeout_seconds`` 还是默认的 110——于是**单图超时永远不可能先触发**：
+#:   13:12:13 收到图 → 13:14:03（+110s）"单条消息识别超预算"
+#:                    → 13:14:18（+120s）那张图的任务才报"视觉请求超时"
+#: 表现就是"超预算"日志刷屏、图片白等，而真正该看到的"视觉超时"晚 15 秒才出现。
+#: 留出余量后，超时会先于预算触发，归因才清楚。
+MESSAGE_BUDGET_RESERVE_RATIO = 0.8
+
+
+def effective_image_timeout(config: Any) -> float:
+    """按整条消息预算夹取后的单图超时。**生效值的唯一真相来源。**
+
+    做成模块级纯函数（而不是只留在插件方法里）是为了让 ``/识图状态`` 报的数与真正
+    用的数**必然一致**。真机踩过"说的和做的不一样"：配置写着 120、实际按 110 的预算走，
+    用户看完状态栏以为配置没生效，又去反复改配置。
+    """
+    configured = float(getattr(config.plugin, "image_timeout_seconds", 0.0) or 0.0)
+    budget = float(getattr(config.plugin, "message_timeout_seconds", 0.0) or 0.0)
+    if budget <= 0:
+        return configured
+    return max(1.0, min(configured, budget * MESSAGE_BUDGET_RESERVE_RATIO))
+
+
+def effective_max_tokens(config: Any) -> int:
+    """视觉请求实际使用的 ``max_tokens``（配置值与下限取大）。纯函数。"""
+    configured = int(getattr(config.vision, "max_tokens", 0) or 0)
+    return max(configured, VISION_MAX_TOKENS_FLOOR)
 
 #: 检索分的实测波动区间（2026-09-18 真机：同一张图、同一份卡片，分数在 0.34~0.40 之间漂，
 #: 因为 description 由视觉模型每次现生成、措辞一变向量就变）。阈值落进这个区间会表现为
@@ -174,7 +217,11 @@ class PluginSectionConfig(PluginConfigBase):
         le=170.0,
         description=(
             "单张图片的识别超时。要覆盖得住慢模型——真机实测视觉模型单次 27~53s，"
-            "25s 会让一半识别直接失败。受 message_timeout_seconds 总预算约束"
+            "25s 会让一半识别直接失败。"
+            "注意这个值是**宿主整条模型回退链**的总预算（模型数 × Provider timeout × 重试次数），"
+            "调大它并不会让慢模型变快，只会让图片白占更久；瓶颈在 MaiBot 模型配置里的 "
+            "Provider timeout。运行期会被夹到 message_timeout_seconds 的 80%——"
+            "单图超时必须先于整条消息预算触发，否则日志只会报「超预算」，真正的超时原因被盖住"
         ),
     )
     card_timeout_seconds: float = Field(
@@ -183,10 +230,18 @@ class PluginSectionConfig(PluginConfigBase):
         le=170.0,
         description=(
             "建卡 / 补卡时单张图的抽取超时。比识别宽松：那时用户已经预期要等，"
-            "没必要和实时识别共用同一个短超时"
+            "没必要和实时识别共用同一个短超时。不受 message_timeout_seconds 夹取"
         ),
     )
-    message_timeout_seconds: float = Field(default=110.0, ge=10.0, le=115.0, description="单条消息的识别总预算")
+    message_timeout_seconds: float = Field(
+        default=110.0,
+        ge=10.0,
+        le=115.0,
+        description=(
+            "单条消息的识别总预算。超预算的图片会被**取消识别**并原样交给 MaiBot"
+            "（不取消的话它们会继续占着并发位和模型配额）"
+        ),
+    )
 
 
 class VisionSectionConfig(PluginConfigBase):
@@ -204,7 +259,17 @@ class VisionSectionConfig(PluginConfigBase):
     model_name: str = Field(default="", description="具体模型名，留空则用任务默认")
     api_key: str = Field(default="", description="直连通道的密钥（host 通道留空）")
     base_url: str = Field(default="", description="直连通道的接口地址（host 通道留空）")
-    max_tokens: int = Field(default=700, ge=64, le=4096, description="视觉请求的最大输出 token")
+    max_tokens: int = Field(
+        default=1600,
+        ge=64,
+        le=4096,
+        description=(
+            "视觉请求的最大输出 token。**低于 1600 会被运行期抬到 1600**："
+            "推理模型的思考 token 也算在这个上限里，真机 700 就触顶，"
+            "JSON 被截断在 evidence 中途 → 整条候选校验作废、表现为「识别没结果」。"
+            "调低不会省钱（只按实际输出计费）"
+        ),
+    )
     temperature: float = Field(default=0.0, ge=0.0, le=2.0, description="视觉请求温度")
     max_upload_bytes: int = Field(default=4194304, ge=65536, description="发给视觉服务的图片体积上限")
 
@@ -416,6 +481,9 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
         self._tasks: set[asyncio.Task] = set()
         #: 视觉超时的建议每次加载只提示一次——反复刷同一条建议会淹掉别的日志。
         self._vision_timeout_hinted = False
+        #: 另外两条**运行期夹取**也各只提示一次（见 ``_vision_max_tokens`` / ``_effective_image_timeout``）。
+        self._vision_token_floor_hinted = False
+        self._image_timeout_clamped_hinted = False
         #: 会话 → [(图片, 标签, 收到时刻)]，保留最近若干张（见 RECENT_IMAGE_LIMIT）。
         self._latest_images: dict[str, list[tuple[bytes, str, float]]] = {}
         self._latest_bytes = 0
@@ -474,6 +542,10 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
         self._index.clear()
         self._breaker.reset()
         self._embed_unavailable_until = 0.0
+        # 一次性提示跟着配置走：用户改完配置要能再看到一次，否则他改了半天也不知道生效没有。
+        self._vision_timeout_hinted = False
+        self._vision_token_floor_hinted = False
+        self._image_timeout_clamped_hinted = False
         if self._repository is not None:
             self._repository.load()
         self.ctx.logger.info("配置已更新（scope=%s），缓存与向量索引已失效", scope)
@@ -725,6 +797,60 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
 
     # ---------------------------------------------------------- 视觉
 
+    def _vision_max_tokens(self) -> int:
+        """视觉请求实际使用的 ``max_tokens``：配置值与下限取大（附带一次性提示）。
+
+        为什么是**运行期**兜底而不是只改默认值：真机上已经存在 ``config.toml``，里面躺着
+        ``max_tokens = 700``——改代码里的 ``Field(default=...)`` 对它毫无影响（Runner 只补
+        新增字段）。要靠"用户自己去改配置"来修一个**静默失败**，等于不修。
+
+        截断的表现是"识别没结果"，用户根本不知道要去改 token 上限；而抬高上限只按实际
+        输出计费，不会多花钱。所以这里直接抬，并**一次性**告诉他实际用了多少。
+        """
+        configured = int(self.config.vision.max_tokens or 0)
+        effective = effective_max_tokens(self.config)
+        if effective <= configured:
+            return effective
+        if not self._vision_token_floor_hinted:
+            self._vision_token_floor_hinted = True
+            self._log(
+                "warning",
+                "视觉 max_tokens 配的是 %d，低于下限 %d，已按 %d 使用。"
+                "调低不会省钱，只会让 JSON 在 evidence 中途被截断（推理模型的思考 token "
+                "也算在这个上限里），表现为识别直接没结果。",
+                configured, VISION_MAX_TOKENS_FLOOR, effective,
+            )
+        return effective
+
+    def _effective_image_timeout(self) -> float:
+        """实时识别的单图超时：按整条消息预算**夹取**后的值（附带一次性提示）。
+
+        不变量是"单图超时必须明显小于整条消息预算"。破坏了它（真机实录：
+        ``image_timeout_seconds=120`` vs ``message_timeout_seconds=110``）的后果不是报错，
+        而是**两条日志的先后顺序反了**——用户看到的是"超预算"，看不到真正的原因；
+        并且那张图的任务还会在预算判定之后继续白跑十几秒、占着并发位。
+
+        建卡/补卡路径**不走这里**：那条路没有整条消息的预算，用 ``card_timeout_seconds``。
+        """
+        effective = effective_image_timeout(self.config)
+        configured = float(self.config.plugin.image_timeout_seconds or 0.0)
+        if effective >= configured or configured <= 0:
+            return effective
+        if not self._image_timeout_clamped_hinted:
+            self._image_timeout_clamped_hinted = True
+            self._log(
+                "warning",
+                "识别超时被夹取：image_timeout_seconds=%.0fs 超过了整条消息预算 %.0fs 的 "
+                "%.0f%%（上限 %.0fs），实际按 %.0fs 用。单图超时必须先于消息预算触发，"
+                "否则「超预算」会盖住真正的超时原因。",
+                configured,
+                self.config.plugin.message_timeout_seconds,
+                MESSAGE_BUDGET_RESERVE_RATIO * 100,
+                effective,
+                effective,
+            )
+        return effective
+
     async def _describe(self, image_bytes: bytes) -> str:
         cfg = self.config.vision
         if not cfg.enabled:
@@ -738,7 +864,10 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
                 image_bytes=image_bytes,
                 task_name=cfg.task_name,
                 model_name=cfg.model_name,
-                timeout_seconds=self.config.plugin.image_timeout_seconds,
+                timeout_seconds=self._effective_image_timeout(),
+                # 描述曾经吃 describe_image 的默认 220，真机实测直接触顶、描述断在句子中途。
+                # 跟识别同用一个（抬高过的）上限，让提示词里的"最多100字"成为唯一约束。
+                max_tokens=self._vision_max_tokens(),
                 max_upload_bytes=cfg.max_upload_bytes,
             )
         except VisionError as exc:
@@ -773,17 +902,22 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
                 model_name=cfg.model_name,
                 api_key=cfg.api_key,
                 base_url=cfg.base_url,
-                timeout_seconds=self.config.plugin.image_timeout_seconds,
-                max_tokens=cfg.max_tokens,
+                timeout_seconds=self._effective_image_timeout(),
+                max_tokens=self._vision_max_tokens(),
                 temperature=cfg.temperature,
                 max_upload_bytes=cfg.max_upload_bytes,
             )
+        except VisionOutputError as exc:
+            # 输出不可解析是**独立的一类失败**：原因（截断 / 跑偏 / 结构不合法）写在异常里，
+            # 原始输出单独回填给 /识图状态——只报一句"不是 JSON"等于让人盲改提示词。
+            self._log("warning", f"候选校验失败（模型输出不可用）：{exc}")
+            return (), str(exc), exc.raw, ""
         except VisionError as exc:
             hint = self._vision_timeout_hint() if "超时" in str(exc) else ""
             self._log("warning", f"候选校验失败：{exc}{hint}")
             return (), f"调用失败：{exc}", "", ""
-        if result is None:
-            return (), "模型输出不是可解析的 JSON", "", ""
+        if result is None:  # 防御：identify_image 现在把"不可解析"改成抛 VisionOutputError
+            return (), "模型输出不可用（没解析出任何内容）", "", ""
         # 模型的格式自觉不可靠（真机出现过"证据逐字抄了库内画像，却把 kind 标成 unknown"），
         # 所以再用确定性比对兜一次。
         result, rescue_note = rescue_unlabeled_candidates(result, catalog)
@@ -1042,9 +1176,53 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
             return None
         return result
 
+    async def _await_with_budget(
+        self, tasks: "list[asyncio.Task]", budget: float
+    ) -> "set[asyncio.Task]":
+        """等这批识别任务到 ``budget`` 秒，**超预算的直接取消**，返回已完成的那批。
+
+        取消是必须的，不是"顺手清理"：超预算的图已经把结论交给 MaiBot（原图放行），它再跑
+        下去没有任何人会读它的结果，却会
+
+        * 继续占着 ``max_concurrency`` 的信号量——后面的消息全排在它后面，一条慢图能把
+          接下来几分钟的识图全拖住；
+        * 继续吃 Host 的模型配额与回退链（真机实录：13:14:03 判定超预算，那张图的任务到
+          13:14:18 才报"视觉请求超时"，白跑 15 秒）；
+        * 在日志里留下一句看起来像本轮结论、其实是弃单的报错。
+
+        早先的写法只 ``_track_task`` 登记不取消，等于把任务留成僵尸。
+        """
+        done, pending = await asyncio.wait(tasks, timeout=budget)
+        if not pending:
+            return done
+        # 一条日志说清整件事：以前是每个未完成任务各打一条，多图时刷屏还看不出总量。
+        self._log(
+            "warning",
+            "单条消息识别超预算（%.0fs）：%d 张图未完成，已取消识别并原样交给 MaiBot",
+            budget, len(pending),
+        )
+        for task in pending:
+            task.cancel()
+            self._track_task(task)
+        return done
+
     def _track_task(self, task: asyncio.Task) -> None:
         self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        task.add_done_callback(self._retire_task)
+
+    def _retire_task(self, task: asyncio.Task) -> None:
+        """任务结束后摘掉引用，并**把异常取出来**。
+
+        只 ``discard`` 不取异常的话，被取消/失败的任务会在 GC 时报
+        "Task exception was never retrieved"，看起来像又出了一条新故障。
+        """
+        self._tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except asyncio.CancelledError:  # pragma: no cover - 竞态兜底
+            pass
 
     # ---------------------------------------------------------- 消息处理
 
@@ -1220,10 +1398,8 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
                 continue
             tasks.append(asyncio.create_task(self._recognize_limited(image_bytes, generation, chat_text)))
 
-        done, pending = await asyncio.wait(tasks, timeout=self.config.plugin.message_timeout_seconds)
-        for task in pending:
-            self._log("warning", "单条消息识别超预算，未完成的图片将原样交给 MaiBot")
-            self._track_task(task)
+        budget = float(self.config.plugin.message_timeout_seconds or 0.0)
+        done = await self._await_with_budget(tasks, budget)
 
         key = self._pending_key(message)
         replacements: "list[list[dict]]" = []
@@ -1983,7 +2159,7 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
                 base_url=self.config.vision.base_url,
                 # 建卡用更宽松的超时：用户此时已预期要等，不该和实时识别共用短超时。
                 timeout_seconds=self.config.plugin.card_timeout_seconds,
-                max_tokens=self.config.vision.max_tokens,
+                max_tokens=self._vision_max_tokens(),
                 max_upload_bytes=self.config.vision.max_upload_bytes,
                 existing_cards=existing,
             )
@@ -1995,16 +2171,27 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
     def _vision_timeout_hint(self) -> str:
         """视觉请求超时时给一次可操作建议。
 
-        "超时"本身对用户没有指导意义：他不知道该改哪、改成多少。而这件事的根因几乎总是
-        模型太慢（真机实测 50s 级），处理方式只有两条——换快模型，或调大超时。
-        只提示一次，免得刷屏。
+        **这条建议第一版是错的，别再改回去。** 原文让用户"调大 plugin.image_timeout_seconds"，
+        而真机照做之后反而更糟：插件侧超时是**宿主整条模型回退链**的总预算
+        （``模型数 × Provider timeout × 每模型重试``），把它调大只是让图片白占得更久；
+        真正的瓶颈在 Host 模型配置里那个 Provider timeout——日志原文
+        「最大超时时间：30s」，插件改不动。
+
+        所以现在指向的是**能真正改变结果**的两件事：给该任务只绑一个快模型（别让一次请求
+        串起 3 个模型 × 2 次重试），以及去 Host 模型配置里调 Provider timeout。
+        同时说明插件侧超时是**夹取**过的，堵住"那我再调大点"这条路。
         """
         if self._vision_timeout_hinted:
             return ""
         self._vision_timeout_hinted = True
         return (
-            f"→ 当前单张超时 {self.config.plugin.image_timeout_seconds:.0f}s；"
-            "该模型单次常超过它。处理方式：换更快的视觉模型，或调大 plugin.image_timeout_seconds"
+            f"→ 本次单图超时 {self._effective_image_timeout():.0f}s（按整条消息预算 "
+            f"{self.config.plugin.message_timeout_seconds:.0f}s 的 "
+            f"{MESSAGE_BUDGET_RESERVE_RATIO * 100:.0f}% 夹取）。"
+            "这个超时是**宿主整条模型回退链**的预算，调大它只会让图片白占更久。"
+            "真正该改的是：① 在 MaiBot 模型配置里给这个视觉任务只绑**一个快模型**"
+            "（日志里的「最大超时时间：30s」是 Provider timeout，一次请求串 3 个模型 × 2 次重试"
+            "必然超预算）；② 把该 Provider 的 timeout 调大。"
         )
 
     def _known_cards(self, name: str) -> "list[str]":
@@ -2394,6 +2581,7 @@ def _status_lines(config: Any, repository: Any, source_configs: dict, cache_size
         f"视觉：{config.vision.provider if config.vision.enabled else '关'}｜"
         f"知识注入：{'开' if config.injection.enabled else '关'}",
         f"候选上限：{config.library.max_prompt_characters}｜反查预留：{config.library.pinned_reserve}",
+        _limits_line(config),
         "反查源：" + "、".join(
             f"{name}{'开' if cfg.enabled else '关'}" for name, cfg in source_configs.items()
         ),
@@ -2403,6 +2591,26 @@ def _status_lines(config: Any, repository: Any, source_configs: dict, cache_size
         "向量检索：" + ("可用" if embed_available else "不可用，已降级为关键词检索"),
     ]
     return "\n".join(lines)
+
+
+def _limits_line(config: Any) -> str:
+    """把**生效的**视觉限额写进状态，并标出它与配置不一致的地方。
+
+    这一行的存在理由全是真机踩出来的：用户按提示把 ``image_timeout_seconds`` 调到 120、
+    而 ``max_tokens`` 还留着 700，两处都是"配了但不生效"（前者被预算夹取、后者被下限抬走）。
+    不把生效值报出来，用户看完状态栏会以为配置没生效，然后反复改配置——越改越远。
+    """
+    text = (
+        f"视觉限额：单图超时 {effective_image_timeout(config):.0f}s"
+        f"（总预算 {config.plugin.message_timeout_seconds:.0f}s）"
+        f"｜max_tokens {effective_max_tokens(config)}"
+    )
+    notes: list[str] = []
+    if effective_image_timeout(config) < float(config.plugin.image_timeout_seconds or 0.0):
+        notes.append("超时已被消息预算夹取")
+    if effective_max_tokens(config) > int(config.vision.max_tokens or 0):
+        notes.append("max_tokens 低于下限已被抬高")
+    return text + ("｜" + "、".join(notes) if notes else "")
 
 
 def create_plugin() -> CharacterRecognizerPlugin:
