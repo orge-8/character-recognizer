@@ -405,6 +405,105 @@ def test_parse_vision_result_returns_none_on_garbage() -> None:
         assert vision.parse_vision_result(bad) is None
 
 
+def test_diagnose_unparsable_separates_truncation_from_rambling() -> None:
+    """三种"解析不了"要给出三种不同的原因。
+
+    真机实录：日志里只有一句"模型输出不是可解析的 JSON"，用户不知道该调 token 上限、
+    该换模型、还是该改提示词——三件事完全不同。截断是最常见的那一种
+    （09-28 两次触顶），所以它必须被单独认出来。
+    """
+    truncated = '{"description":"蓝发少女","candidates":[{"kind":"pri'
+    note = vision.diagnose_unparsable(truncated, max_tokens=700)
+    assert "截断" in note and "700" in note
+
+    rambling = "这张图里有一个人物，她是……"
+    assert "没有按 JSON 回答" in vision.diagnose_unparsable(rambling)
+
+    malformed = '{"description": "x", "candidates": }'
+    assert "结构不合法" in vision.diagnose_unparsable(malformed)
+
+    assert "空内容" in vision.diagnose_unparsable("")
+
+
+def test_is_timeout_error_recognizes_cross_process_timeouts() -> None:
+    """超时判定不能靠 isinstance。
+
+    RPC 超时抛的是 SDK 自己的异常类，跨进程 msgpack 重建后与本地 import 到的**不是同一个
+    类对象**——本地 isinstance 判断会假绿。所以判据必须是「isinstance / 类名 / 文本」三取一。
+    """
+    assert vision._is_timeout_error(asyncio.TimeoutError())
+    assert vision._is_timeout_error(TimeoutError())
+
+    class RPCError(Exception):  # 名字与真机一致，但**不是**本地那个类
+        pass
+
+    assert vision._is_timeout_error(RPCError("[E_TIMEOUT] 请求 cap.call 超时 (180000ms)"))
+    assert not vision._is_timeout_error(RPCError("connection refused"))
+
+
+def test_identify_image_raises_output_error_with_raw_on_truncation() -> None:
+    """截断的输出必须**抛**且带上原始输出，而不是安静地返回 None。
+
+    返回 None 会让上层只说一句"不是可解析的 JSON"，而原始输出（唯一能证明"是被截断"
+    的证据）当场丢掉，``/识图状态`` 也就无从回看。
+    """
+    from vision import VisionOutputError, identify_image
+
+    truncated = '{"description":"蓝发少女","candidates":[{"kind":"pri'
+
+    async def fake_generate(**kwargs):
+        return {"success": True, "response": truncated}
+
+    import pytest
+
+    with pytest.raises(VisionOutputError) as info:
+        asyncio.run(identify_image(
+            provider="host",
+            image_bytes=b"\x89PNG\r\n\x1a\n",
+            catalog=[{"name": "甲", "appearance_cards": ["蓝发"]}],
+            generate=fake_generate,
+            timeout_seconds=5.0,
+            max_tokens=700,
+        ))
+    assert "截断" in str(info.value)
+    assert info.value.raw.startswith('{"description"')
+    # 仍然是 VisionError：既有的 except VisionError 兜底路径不能因此漏掉。
+    assert isinstance(info.value, vision.VisionError)
+
+
+def test_identify_image_returns_empty_result_for_valid_but_contentless_json() -> None:
+    """合法 JSON 但零信息 ≠ 调用失败，两者要分开报。"""
+    from vision import identify_image
+
+    async def fake_generate(**kwargs):
+        return {"success": True, "response": '{"description":"","candidates":[]}'}
+
+    result = asyncio.run(identify_image(
+        provider="host",
+        image_bytes=b"\x89PNG\r\n\x1a\n",
+        catalog=[{"name": "甲", "appearance_cards": ["蓝发"]}],
+        generate=fake_generate,
+        timeout_seconds=5.0,
+        max_tokens=700,
+    ))
+    assert result is not None
+    assert result.candidate_names == ()
+    assert result.raw  # 原始输出留着，供 /识图状态 回看
+
+
+def test_describe_image_default_ceiling_covers_the_prompt_budget() -> None:
+    """describe 的默认上限必须高于"最多100字"实际需要的 token。
+
+    真机 09-28 13:12:18 实测 220 触顶、描述断在句子中途。推理模型的思考 token 也占
+    这个上限，所以"100 字 ≈ 150 token"这种账算不住。
+    """
+    import inspect
+
+    signature = inspect.signature(vision.describe_image)
+    assert signature.parameters["max_tokens"].default >= 400
+
+
+
 def test_only_private_candidates_with_evidence_are_usable() -> None:
     from models import VisionResult
 

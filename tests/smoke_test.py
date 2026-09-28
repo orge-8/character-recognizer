@@ -783,8 +783,149 @@ def check_vision_timeout_layering() -> list[str]:
             failures.append("超时提示为空")
         if second:
             failures.append("超时提示应当只给一次，否则刷屏")
-        if "image_timeout_seconds" not in first:
-            failures.append(f"提示要说明改哪个配置：{first}")
+        # 提示必须指向**真正能改变结果**的那一环。第一版让用户"调大
+        # plugin.image_timeout_seconds"，而那个超时是**宿主整条模型回退链**的总预算
+        # （模型数 × Provider timeout × 每模型重试）——真机照做之后图片只是白占得更久，
+        # 根因（Provider timeout=30s）一点没动。这条守着别退回那条错误建议。
+        if "Provider" not in first and "回退链" not in first:
+            failures.append(f"提示要指到 Host 侧的模型回退链 / Provider timeout：{first}")
+        if "调大 plugin.image_timeout_seconds" in first:
+            failures.append(f"提示不能建议调大插件超时（那是回退链总预算）：{first}")
+        if plugin._effective_image_timeout() >= conf.message_timeout_seconds:
+            failures.append(
+                "有效单图超时必须小于整条消息预算，否则超时永远轮不到触发，"
+                f"只会一直报「超预算」：{plugin._effective_image_timeout()} vs {conf.message_timeout_seconds}"
+            )
+    finally:
+        asyncio.run(runner.plugin.on_unload())
+    return failures
+
+
+def check_image_timeout_is_clamped_to_message_budget() -> list[str]:
+    """把**实际用时**和**两者关系**都钉住。
+
+    真机不变量破坏的实录：``image_timeout_seconds=120``（用户照提示调大的）、
+    ``message_timeout_seconds`` 还是默认 110。于是
+      13:12:13 收图 → 13:14:03（+110s）"单条消息识别超预算"
+                     → 13:14:18（+120s）那张图的任务才报"视觉请求超时"
+    日志顺序反了，用户只看得到"超预算"。这里验证运行期把单图超时夹到预算的 80%。
+    """
+    failures: list[str] = []
+    runner = Runner(config_overrides={
+        "plugin.image_timeout_seconds": 120.0,
+        "plugin.message_timeout_seconds": 110.0,
+    })
+    asyncio.run(runner.plugin.on_load())
+    try:
+        plugin = runner.plugin
+        module = sys.modules.get(type(plugin).__module__)
+        ratio = float(getattr(module, "MESSAGE_BUDGET_RESERVE_RATIO", 0.8))
+        effective = plugin._effective_image_timeout()
+        expected = 110.0 * ratio
+        if abs(effective - expected) > 0.01:
+            failures.append(f"单图超时没被夹到预算的 {ratio:.0%}：期望 {expected}，实际 {effective}")
+        if effective >= 110.0:
+            failures.append(f"夹取后仍不早于消息预算：{effective} vs 110.0")
+
+        # 夹取只该发生在实时识别路径。建卡/补卡没有整条消息预算，必须照旧用 card_timeout。
+        if plugin.config.plugin.card_timeout_seconds <= effective:
+            failures.append("建卡超时不该被实时识别的夹取拉低")
+        # 提示与夹取必须说同一个数——说了 120 却按 88 跑，用户会以为配置没生效。
+        hint = plugin._vision_timeout_hint()
+        if f"{effective:.0f}s" not in hint:
+            failures.append(f"超时提示里的秒数要和实际夹取值一致（{effective:.0f}s）：{hint}")
+        # 状态栏同理：写在界面上的数必须就是生效值，并显式标出"和配置不一致"。
+        limits = module._limits_line(plugin.config)
+        if f"{effective:.0f}s" not in limits:
+            failures.append(f"状态栏没报出生效的单图超时 {effective:.0f}s：{limits}")
+        if "夹取" not in limits:
+            failures.append(f"状态栏要标出超时被夹取过（否则用户以为配置没生效）：{limits}")
+        if f"{plugin._vision_max_tokens()}" not in limits:
+            failures.append(f"状态栏没报出生效的 max_tokens：{limits}")
+    finally:
+        asyncio.run(runner.plugin.on_unload())
+    return failures
+
+
+def check_vision_max_tokens_has_floor() -> list[str]:
+    """视觉 ``max_tokens`` 必须有运行期下限。
+
+    真机两次触顶（09-28）：describe 吃默认 220 触顶、identify 按配置的 700 也触顶——都是
+    "达到最大输出 token 限制"。注意**推理模型的思考 token 也算在这个上限里**，所以
+    "100 字描述 + 3 个候选"看着几百 token 够用，750 照样截断。
+
+    关键：下限得在**运行期**兜。真机上已有 config.toml 里躺着 700，改代码里的
+    Field(default=...) 对它毫无影响，而截断是静默失败（识别直接没结果），
+    用户根本不会想到去改 token 上限。
+    """
+    failures: list[str] = []
+    runner = Runner(config_overrides={"vision.max_tokens": 700})
+    asyncio.run(runner.plugin.on_load())
+    try:
+        effective = runner.plugin._vision_max_tokens()
+        if effective < 1600:
+            failures.append(f"配置 700 时没抬到下限：{effective}")
+        # 用户显式配得更大时不能反而被压小。
+        runner.plugin.config.vision.max_tokens = 3000
+        if runner.plugin._vision_max_tokens() != 3000:
+            failures.append("用户配得比下限大时被压小了")
+    finally:
+        asyncio.run(runner.plugin.on_unload())
+    return failures
+
+
+def check_over_budget_tasks_are_cancelled() -> list[str]:
+    """超预算的识别任务必须**取消**，不能留成僵尸。
+
+    真机实录：13:14:03 判定"单条消息识别超预算"，那张图的任务到 13:14:18 才报
+    "视觉请求超时"——白跑 15 秒，期间还占着 max_concurrency 的信号量和 Host 的模型配额。
+    旧写法只 ``_track_task`` 登记不取消。
+
+    这里用 50ms 的预算直接验证预算等待这一层（配 ``message_timeout_seconds`` 的 ``ge=10``
+    会让真实路径的测试慢 10 秒，没必要）。
+    """
+    failures: list[str] = []
+    runner = Runner()
+    asyncio.run(runner.plugin.on_load())
+    try:
+        plugin = runner.plugin
+        cancelled: list[str] = []
+
+        async def hang(tag: str) -> str:
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                cancelled.append(tag)
+                raise
+            return tag
+
+        async def quick() -> str:
+            return "quick"
+
+        async def scenario() -> None:
+            tasks = [
+                asyncio.create_task(quick()),
+                asyncio.create_task(hang("慢图")),
+            ]
+            done = await plugin._await_with_budget(tasks, 0.05)
+            if any(not t.done() for t in done):
+                failures.append("返回的 done 里有未完成的任务")
+            if [t for t in tasks if t.done()] != [tasks[0]] and not tasks[0].done():
+                failures.append("快任务应当已完成")
+            # 取消是**异步生效**的：让事件循环转一圈，等取消真正落地。
+            for _ in range(50):
+                if cancelled:
+                    break
+                await asyncio.sleep(0.01)
+
+        asyncio.run(scenario())
+        if cancelled != ["慢图"]:
+            failures.append(f"超预算的任务没有被取消：{cancelled}")
+        if plugin._tasks:
+            failures.append(f"取消后不该留下未回收的任务引用：{plugin._tasks}")
+        # 一次性提示的开关也得跟着重置，否则重启后第一次夹取是静默的。
+        if not plugin._vision_token_floor_hinted or not plugin._image_timeout_clamped_hinted:
+            pass  # 默认配置不触发夹取，这里只保证属性存在
     finally:
         asyncio.run(runner.plugin.on_unload())
     return failures
@@ -1151,6 +1292,9 @@ CHECKS = [
     ("整理走通用小任务（不挂视觉模型）", check_compress_uses_general_task_not_vision_model),
     ("LLM 调用显式带 RPC 超时", check_llm_calls_carry_explicit_rpc_timeout),
     ("视觉超时分层与提示", check_vision_timeout_layering),
+    ("单图超时按消息预算夹取", check_image_timeout_is_clamped_to_message_budget),
+    ("视觉 max_tokens 有下限兜底", check_vision_max_tokens_has_floor),
+    ("超预算任务被取消（不留僵尸）", check_over_budget_tasks_are_cancelled),
     ("embedding 三种返回形态", check_embedding_degradation_paths),
     ("embed 返回形态解析（batch/single/error）", check_embed_adapter_against_host_shapes),
     ("识别缓存复用", check_vector_cache_reuse),

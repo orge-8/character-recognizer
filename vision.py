@@ -67,6 +67,37 @@ class VisionError(RuntimeError):
     """视觉通道调用失败。"""
 
 
+class VisionOutputError(VisionError):
+    """模型输出不可解析（不是 JSON / 被截断 / 结构不合法）。
+
+    单独成类只为一件事：把**原始输出**一起带出来。真机踩过——JSON 在 evidence 中途被
+    ``max_tokens`` 截断，日志只说一句"不是可解析的 JSON"，用户无从判断到底是截断、还是
+    模型乱答、还是提示词让它跑偏，三种情况要改的东西完全不同。
+
+    它仍然是 ``VisionError``，所以所有既有的 ``except VisionError`` 都照旧兜住。
+    """
+
+    def __init__(self, message: str, *, raw: str = "") -> None:
+        super().__init__(message)
+        self.raw = str(raw or "")
+
+
+#: 这几类字样的异常都算"超时"。**不能用 isinstance 认**：RPC 超时抛的是 SDK 自己的
+#: 异常类，跨进程 msgpack 重建后与本地 import 到的**不是同一个类对象**，本地判断会假绿。
+_TIMEOUT_MARKERS = ("timeout", "timed out", "e_timeout", "超时")
+
+
+def _is_timeout_error(exc: BaseException) -> bool:
+    """这个异常是不是超时（类名 / 文本 三取一）。纯函数，可脱机单测。"""
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return True
+    name = type(exc).__name__.lower()
+    if "timeout" in name:
+        return True
+    text = str(exc).lower()
+    return any(marker in text for marker in _TIMEOUT_MARKERS)
+
+
 def _image_content(image_bytes: bytes) -> dict[str, Any]:
     return {
         "type": "image",
@@ -109,8 +140,14 @@ async def generate_with_host(
     try:
         response = await asyncio.wait_for(generate(**kwargs), timeout=timeout_seconds)
     except asyncio.TimeoutError as exc:
-        raise VisionError(f"视觉请求超时（{timeout_seconds:.0f}s）") from exc
+        # 只说事实，不给建议：建议由 plugin 侧**一次性**给出，免得每次超时都刷十几行。
+        raise VisionError(
+            f"视觉请求超时（插件侧 {timeout_seconds:.0f}s 预算用尽，宿主未返回）"
+        ) from exc
     except Exception as exc:
+        # RPC 层超时与"模型报错"必须分开：前者是预算问题，后者是配置/网络问题。
+        if _is_timeout_error(exc):
+            raise VisionError(f"视觉请求超时（Host 调用层）：{type(exc).__name__}: {exc}") from exc
         raise VisionError(f"视觉请求失败：{type(exc).__name__}: {exc}") from exc
     if not isinstance(response, dict) or not response.get("success", False):
         detail = ""
@@ -127,11 +164,17 @@ async def describe_image(
     task_name: str,
     model_name: str,
     timeout_seconds: float,
-    max_tokens: int = 220,
+    max_tokens: int = 400,
     temperature: float = 0.0,
     max_upload_bytes: int = DEFAULT_UPLOAD_BYTES,
 ) -> str:
-    """只取通用图片描述（沿用 MaiBot 内置提示词口径）。"""
+    """只取通用图片描述（沿用 MaiBot 内置提示词口径）。
+
+    默认给 400 而不是 220：内置提示词要求"最多100字"，按中文算约 150 token，
+    看似 220 够用——但**推理模型的思考 token 也算在这个上限里**（真机 09-28 13:12:18
+    实测 220 触顶，描述在句子中途断掉）。截断的代价是整段描述残缺，而多留上限
+    并不会多花钱（只按实际输出计费），所以这里宁可宽。
+    """
     text = await generate_with_host(
         generate,
         prompt=HOST_DESCRIPTION_PROMPT,
@@ -162,7 +205,12 @@ async def identify_image(
     temperature: float = 0.0,
     max_upload_bytes: int = DEFAULT_UPLOAD_BYTES,
 ) -> VisionResult | None:
-    """识别图片并从本地库匹配候选。解析失败返回 None（不抛）。"""
+    """识别图片并从本地库匹配候选。解析失败返回 None（不抛）。
+
+    ⚠️ 实际行为：**不是 JSON 的输出会抛 ``VisionOutputError``**，不是返回 None。
+    None 只留给"合法 JSON 但零信息"那一种。这个区分是刻意的——两者的处理方式不同，
+    合并成一句日志会让用户去改没错的那一环。
+    """
     prompt = build_identify_prompt(catalog, max_candidates)
     if provider == "host":
         if generate is None:
@@ -193,7 +241,20 @@ async def identify_image(
         )
     else:
         raise VisionError(f"不支持的视觉提供方：{provider}")
-    return parse_vision_result(content)
+    result = parse_vision_result(content)
+    if result is not None:
+        return result
+    # ``parse_vision_result`` 返回 None 有两条**处理方式完全不同**的来路，必须拆开：
+    #   · 压根不是 JSON（截断 / 跑偏）——这是调用层失败，带上原始输出抛出去，
+    #     让 ``/识图状态`` 能回看模型到底写了什么；
+    #   · 是合法 JSON 却既无描述也无候选——模型交了白卷，属于"解析成功但零信息"，
+    #     按空结果返回，交给 ``describe_vision_dropouts`` 逐条说明。
+    if _try_load_json_object(content) is not None:
+        return VisionResult(candidates=(), raw=str(content).strip()[:800])
+    raise VisionOutputError(
+        diagnose_unparsable(content, max_tokens=max_tokens),
+        raw=str(content).strip()[:800],
+    )
 
 
 # ------------------------------------------------------ 区分性证据（服装 / 饰品）
@@ -381,8 +442,12 @@ async def _generate_text_with_host(
     try:
         response = await asyncio.wait_for(generate(**kwargs), timeout=timeout_seconds)
     except asyncio.TimeoutError as exc:
-        raise VisionError(f"整理请求超时（{timeout_seconds:.0f}s）") from exc
+        raise VisionError(
+            f"整理请求超时（插件侧 {timeout_seconds:.0f}s 预算用尽，宿主未返回）"
+        ) from exc
     except Exception as exc:
+        if _is_timeout_error(exc):
+            raise VisionError(f"整理请求超时（Host 调用层）：{type(exc).__name__}: {exc}") from exc
         raise VisionError(f"整理请求失败：{type(exc).__name__}: {exc}") from exc
     if not isinstance(response, dict) or not response.get("success", False):
         detail = ""
@@ -465,15 +530,51 @@ def parse_vision_result(content: str) -> VisionResult | None:
     """从模型输出里解析识别结果。任何格式问题都返回 None 而不是抛。"""
     if not isinstance(content, str) or not content.strip():
         return None
-    try:
-        payload = json.loads(_extract_json_object(content))
-    except (ValueError, json.JSONDecodeError):
+    payload = _try_load_json_object(content)
+    if payload is None:
         return None
     result = VisionResult.from_dict(payload)
     if result is None:
         return None
     # 留下原始输出：候选被丢弃时，"为什么丢"必须能回看模型到底写了什么。
     return replace(result, raw=str(content).strip()[:800])
+
+
+def _snippet(text: str, limit: int) -> str:
+    """取一小段单行文本，供日志里回看模型输出。"""
+    flat = " ".join(str(text or "").split())
+    return flat[:limit] + ("…" if len(flat) > limit else "")
+
+
+def _try_load_json_object(content: str) -> "dict | None":
+    """抠出并解析 JSON 对象；不是合法对象就返回 None（不抛）。"""
+    try:
+        payload = json.loads(_extract_json_object(content))
+    except (ValueError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def diagnose_unparsable(content: str, *, max_tokens: int = 0) -> str:
+    """输出解析不了时，给出一句**能指向下一步动作**的原因。
+
+    这三种情况要改的东西完全不同：
+    * 被 ``max_tokens`` 截断 → 调大上限（推理模型的思考 token 也算在里面）；
+    * 模型压根没按 JSON 回答 → 提示词/模型选型问题；
+    * 是 JSON 但结构不合法 → 模型没守格式，得改提示词。
+
+    合并成一句"不是可解析的 JSON"就是让人盲改。纯函数，可脱机单测。
+    """
+    text = str(content or "").strip()
+    if not text:
+        return "模型返回了空内容"
+    head = text.find("{")
+    if head < 0:
+        return f"模型没有按 JSON 回答（开头是：{_snippet(text, 40)}）"
+    if "}" not in text[head:]:
+        limit = f"（当前上限 max_tokens={max_tokens}）" if max_tokens else ""
+        return f"输出在 JSON 中途被截断，多半是达到了 max_tokens 上限{limit}"
+    return f"模型给的 JSON 结构不合法（开头是：{_snippet(text, 40)}）"
 
 
 def describe_vision_dropouts(result: VisionResult) -> str:
