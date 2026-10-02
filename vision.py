@@ -464,7 +464,7 @@ async def compress_appearance_cards(
     generate: GenerateFn | None = None,
     task_name: str = "vlm",
     model_name: str = "",
-    timeout_seconds: float = 90.0,
+    timeout_seconds: float = 180.0,
     max_tokens: int = 900,
 ) -> "tuple[list[str] | None, str]":
     """把外观卡整理成更少、不重复的一组。返回 ``(整理结果, 说明)``。
@@ -476,8 +476,9 @@ async def compress_appearance_cards(
     而当时超时设的是 45s），但日志只报"未生效"，看不出是超时、跳过还是模型不听话——
     三种情况的处理方式完全不同（调超时 / 换模型 / 改提示词）。
 
-    默认超时给到 90s：整理是纯文本任务但输出有十多条中文，遇到慢模型（实测 56.8s）
-    45s 会直接掐掉。
+    默认超时 180s：必须盖过**宿主整条模型回退链**的硬超时（120s）。真机 10-01 实录：
+    插件侧 90s 预算先放弃，宿主又过了 30 秒才 120s 硬超时切下一个模型——本可救回的
+    回退被插件先掐了，日志里还只剩"插件放弃"，看不到真正的 Provider 故障。
 
     只走 ``host`` 通道：直连通道（gemini/openai）的密钥与模型是给视觉准备的，为了一个
     可选增强去各写一份纯文本实现不划算，跳过即可（调用方照常保留原卡片）。

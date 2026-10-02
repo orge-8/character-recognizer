@@ -69,6 +69,44 @@ class SourceConfig:
     weak_similarity: float = 60.0
 
 
+def source_configs_from(config: Any) -> "dict[str, SourceConfig]":
+    """把插件配置里的三个源节映射成 ``SourceConfig``（纯映射，不依赖配置类）。
+
+    每个源的开关 / 超时 / 上限原本分散在各配置节里，转换集中在这里：plugin.py 只留
+    一行转发。入参按鸭子类型处理（只读属性），所以本函数不需要 import 任何配置类，
+    也不受配置字段增删的影响。
+    """
+    return {
+        "anime_trace": SourceConfig(
+            name="anime_trace",
+            enabled=config.anime_trace.enabled,
+            url=config.anime_trace.url,
+            timeout_seconds=config.anime_trace.timeout_seconds,
+            max_upload_bytes=config.anime_trace.max_upload_bytes,
+            max_candidates=config.anime_trace.max_candidates,
+        ),
+        "saucenao": SourceConfig(
+            name="saucenao",
+            enabled=config.saucenao.enabled,
+            url=config.saucenao.url,
+            timeout_seconds=config.saucenao.timeout_seconds,
+            max_upload_bytes=config.saucenao.max_upload_bytes,
+            api_key=config.saucenao.api_key,
+            max_candidates=config.saucenao.max_candidates,
+            confident_similarity=config.saucenao.confident_similarity,
+            weak_similarity=config.saucenao.weak_similarity,
+        ),
+        "trace_moe": SourceConfig(
+            name="trace_moe",
+            enabled=config.trace_moe.enabled,
+            url=config.trace_moe.url,
+            timeout_seconds=config.trace_moe.timeout_seconds,
+            max_upload_bytes=config.trace_moe.max_upload_bytes,
+            max_candidates=config.trace_moe.max_candidates,
+        ),
+    }
+
+
 def _multipart(image_bytes: bytes, mime_type: str, *, field: str = "file") -> tuple[bytes, str]:
     boundary = f"----MaiBotCharacter{uuid.uuid4().hex}"
     head = (

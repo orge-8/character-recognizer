@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""进程内运行时设施：LRU+TTL 缓存与熔断器（不依赖 ctx）。"""
+"""进程内运行时设施：LRU+TTL 缓存、熔断器与后台任务登记册（不依赖 ctx）。"""
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -105,3 +106,75 @@ class CircuitBreaker:
             self._states.clear()
         else:
             self._states.pop(service, None)
+
+
+class TaskRegistry:
+    """后台任务登记册：防僵尸任务、防「exception was never retrieved」、超预算取消。
+
+    不碰 ctx：日志通过构造时注入的 ``log`` 回调上报（签名与 ``logging`` 一致，
+    plugin.py 直接把 ``_log`` 传进来）。
+    """
+
+    def __init__(self, log: Callable[..., None] | None = None) -> None:
+        self._log = log
+        #: 有意公开：plugin.py 把它别名成 ``_tasks``，既有测试直接 gather 这个集合
+        #: 等后台任务收尾。清空必须走 ``cancel_all``/``clear``（就地），别让别名失效。
+        self.tasks: set[asyncio.Task] = set()
+
+    def track(self, task: asyncio.Task) -> None:
+        self.tasks.add(task)
+        task.add_done_callback(self.retire)
+
+    def retire(self, task: asyncio.Task) -> None:
+        """任务结束后摘掉引用，并**把异常取出来**。
+
+        只 ``discard`` 不取异常的话，被取消/失败的任务会在 GC 时报
+        "Task exception was never retrieved"，看起来像又出了一条新故障。
+        """
+        self.tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except asyncio.CancelledError:  # pragma: no cover - 竞态兜底
+            pass
+
+    async def cancel_all(self) -> None:
+        """取消全部登记任务并等它们收尾（on_unload 用）。就地清空，别名不失效。"""
+        for task in list(self.tasks):
+            if not task.done():
+                task.cancel()
+        if self.tasks:
+            await asyncio.gather(*self.tasks, return_exceptions=True)
+        self.tasks.clear()
+
+    async def await_with_budget(
+        self, tasks: "list[asyncio.Task]", budget: float
+    ) -> "set[asyncio.Task]":
+        """等这批识别任务到 ``budget`` 秒，**超预算的直接取消**，返回已完成的那批。
+
+        取消是必须的，不是"顺手清理"：超预算的图已经把结论交给 MaiBot（原图放行），它再跑
+        下去没有任何人会读它的结果，却会
+
+        * 继续占着 ``max_concurrency`` 的信号量——后面的消息全排在它后面，一条慢图能把
+          接下来几分钟的识图全拖住；
+        * 继续吃 Host 的模型配额与回退链（真机实录：13:14:03 判定超预算，那张图的任务到
+          13:14:18 才报"视觉请求超时"，白跑 15 秒）；
+        * 在日志里留下一句看起来像本轮结论、其实是弃单的报错。
+
+        早先的写法只 ``track`` 登记不取消，等于把任务留成僵尸。
+        """
+        done, pending = await asyncio.wait(tasks, timeout=budget)
+        if not pending:
+            return done
+        # 一条日志说清整件事：以前是每个未完成任务各打一条，多图时刷屏还看不出总量。
+        if self._log is not None:
+            self._log(
+                "warning",
+                "单条消息识别超预算（%.0fs）：%d 张图未完成，已取消识别并原样交给 MaiBot",
+                budget, len(pending),
+            )
+        for task in pending:
+            task.cancel()
+            self.track(task)
+        return done

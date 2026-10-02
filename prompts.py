@@ -64,29 +64,6 @@ def build_identify_prompt(catalog: Sequence[dict], max_candidates: int = 3) -> s
     )
 
 
-def build_compression_prompt(category: str, cards: "Sequence[str]", limit: int) -> str:
-    """让模型把同一类别里重复度高的外观卡合并成更精炼的几条。
-
-    为什么要专门做这件事：建卡是**逐张图**抽的，模型每次都会把"蓝发 + 刘海"重写一遍，
-    五张图就攒出五条近义卡。它们挤占 15 条的总额，把别的类别的配额顶掉——而真正有区分度
-    的细节（比如"螺旋状发束""红色标记"）反而被淹没了。
-
-    卡片文本同样是不可信输入（模型自己产的），所以照样过 ``neutralize``。
-    """
-    rendered = "\n".join(f"- {card}" for card in cards)
-    return (
-        f"同一个二次元角色的「{category}」类外观描述有以下若干条，来自不同图片，彼此大量重复。\n"
-        f"请合并成不超过 {limit} 条：保留全部**不同的**信息，删掉重复与措辞差异。\n"
-        "只输出 JSON，不要 Markdown，不要解释：{\"cards\":[\"...\"]}\n"
-        "规则：\n"
-        "1. 每条仍是一句客观中文描述，不超过 55 字；不写背景、姿势、表情、画质、镜头。\n"
-        "2. 同义表述要合并（「浅蓝色长发」与「浅天蓝色长直发」可并为一条），"
-        "但只有部分图片才有的细节必须保留（如「螺旋状发束」「头顶的黑色圆环」）。\n"
-        "3. 不要引入原文没有的信息；不要推测角色名或作品名。\n"
-        f"原文：\n{neutralize(rendered)}"
-    )
-
-
 def build_appearance_prompt(existing_cards: "Sequence[str]" = ()) -> str:
     """为管理员建卡时抽取稳定外观特征。刻意不要求推测角色名。
 

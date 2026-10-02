@@ -11,11 +11,25 @@
 4. 角色库损坏时降级为空库并留证，不再 raise 把 on_load 打挂。
 
 **本文件是唯一允许出现 ``self.ctx`` 的地方**：``check_plugin.py`` 只扫描本文件推导
-能力名，其它模块里写 ctx 会造成"静态检查全绿、真机拒绝授权"。纯逻辑一律写在
-textutil / models / fusion / retrieval / imaging / runtime / sources / vision / prompts 里。
+能力名，其它模块里写 ctx 会造成"静态检查全绿、真机拒绝授权"。下面这些模块各自
+只管一块纯逻辑，都不认识宿主：
+
+| 层 | 模块 | 管什么 |
+|---|---|---|
+| 文本 / 数据模型 | ``textutil`` ``models`` | 脱敏、字数、类别判定；Character / Hit / Result 等数据结构 |
+| 检索与融合 | ``retrieval`` ``fusion`` | 相关性选候选入库;多源结果去重融合、分源计数 |
+| 取图 | ``imaging`` | 下载、SSRF 防护、手动逐跳重定向、格式嗅探 |
+| 近期图记忆 | ``imagememo`` | 按会话缓存最近图片(容量/时间窗/字节三重上限) |
+| 角色库 | ``repository`` ``sources`` | 持久化、演进、兼容加载;各反查源的调用与限流 |
+| 运行时 | ``runtime`` | TTL 缓存、熔断器、后台任务登记与撤销 |
+| 视觉 / 提示词 | ``vision`` ``prompts`` | VLM 调用与外观卡抽取;所有提示词文本 |
+| 渲染 | ``rendering`` | 结果→用户可见文案的纯格式化，不含业务逻辑 |
+| 编排 | ``pipeline`` | 识别三阶段(描绘→ retrieve→ 判定)；经 ports 注入依赖 |
+| 注入 | ``inject`` | 把结果写回宿主消息 / prompt，幂等标记 |
 """
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,13 +40,9 @@ from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBa
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParameterInfo, ToolParamType
 
 try:
-    from .fusion import FusionOptions, describe_hits, fuse
-    from .imaging import (
-        download_image,
-        extract_image_payload,
-        host_resolves_to_public,
-        sha256_hex,
-    )
+    from .fusion import FusionOptions, fuse
+    from .imaging import download_image, extract_image_payload, host_resolves_to_public
+    from .imagememo import RecentImageStore
     from .inject import apply_injection, apply_rewrite
     from .models import (
         UNRECOGNIZED_LABEL,
@@ -40,15 +50,38 @@ try:
         Query,
         RecognitionResult,
         SourceHit,
-        TIER_CONFIRMED,
         TIER_LOCAL,
     )
+    from .pipeline import PipelinePorts, RecognitionPipeline
     from .prompts import build_capability_hint, build_knowledge_block
+    from .rendering import (
+        MESSAGE_BUDGET_RESERVE_RATIO,
+        VISION_MAX_TOKENS_FLOOR,
+        appearance_summary,
+        describe_result,
+        diagnose_local_confirm,
+        effective_image_timeout,
+        effective_max_tokens,
+        fallback_line,
+        limits_line,
+        names_from_label,
+        render_appearance_cards,
+        render_character,
+        render_diagnosis,
+        render_probe,
+        render_source_error,
+        status_lines,
+    )
     from .repository import CharacterRepository
-    from .retrieval import EmbeddingIndex, RetrievalOptions, build_reverse_confidence, retrieve
-    from .runtime import CircuitBreaker, TTLCache
-    from .sources import IMPLEMENTED_SOURCES, SourceConfig, probe_endpoint, run_source
-    from .textutil import CORE_APPEARANCE_CATEGORIES, group_appearance_cards
+    from .retrieval import EmbeddingIndex, RetrievalOptions, retrieve
+    from .runtime import CircuitBreaker, TTLCache, TaskRegistry
+    from .sources import (
+        IMPLEMENTED_SOURCES,
+        SourceConfig,
+        probe_endpoint,
+        run_source,
+        source_configs_from,
+    )
     from .vision import (
         VisionError,
         VisionOutputError,
@@ -60,13 +93,9 @@ try:
         rescue_unlabeled_candidates,
     )
 except ImportError:  # pragma: no cover - Runner 只把目录塞进 sys.path 时走这条
-    from fusion import FusionOptions, describe_hits, fuse
-    from imaging import (
-        download_image,
-        extract_image_payload,
-        host_resolves_to_public,
-        sha256_hex,
-    )
+    from fusion import FusionOptions, fuse
+    from imaging import download_image, extract_image_payload, host_resolves_to_public
+    from imagememo import RecentImageStore
     from inject import apply_injection, apply_rewrite
     from models import (
         UNRECOGNIZED_LABEL,
@@ -74,15 +103,38 @@ except ImportError:  # pragma: no cover - Runner 只把目录塞进 sys.path 时
         Query,
         RecognitionResult,
         SourceHit,
-        TIER_CONFIRMED,
         TIER_LOCAL,
     )
+    from pipeline import PipelinePorts, RecognitionPipeline
     from prompts import build_capability_hint, build_knowledge_block
+    from rendering import (
+        MESSAGE_BUDGET_RESERVE_RATIO,
+        VISION_MAX_TOKENS_FLOOR,
+        appearance_summary,
+        describe_result,
+        diagnose_local_confirm,
+        effective_image_timeout,
+        effective_max_tokens,
+        fallback_line,
+        limits_line,
+        names_from_label,
+        render_appearance_cards,
+        render_character,
+        render_diagnosis,
+        render_probe,
+        render_source_error,
+        status_lines,
+    )
     from repository import CharacterRepository
-    from retrieval import EmbeddingIndex, RetrievalOptions, build_reverse_confidence, retrieve
-    from runtime import CircuitBreaker, TTLCache
-    from sources import IMPLEMENTED_SOURCES, SourceConfig, probe_endpoint, run_source
-    from textutil import CORE_APPEARANCE_CATEGORIES, group_appearance_cards
+    from retrieval import EmbeddingIndex, RetrievalOptions, retrieve
+    from runtime import CircuitBreaker, TTLCache, TaskRegistry
+    from sources import (
+        IMPLEMENTED_SOURCES,
+        SourceConfig,
+        probe_endpoint,
+        run_source,
+        source_configs_from,
+    )
     from vision import (
         VisionError,
         VisionOutputError,
@@ -94,6 +146,23 @@ except ImportError:  # pragma: no cover - Runner 只把目录塞进 sys.path 时
         rescue_unlabeled_candidates,
     )
 
+# ── rendering.py 兼容别名 ─────────────────────────────────────────────
+# 渲染层已拆到 rendering.py（公开名，无前导下划线）。下列旧私有名在本文件内部调用与
+# 既有测试（test_pipeline / test_limits / smoke_test 按模块属性引用）中沿用，保留别名
+# 可以让调用点与测试**零改动**；新代码请直接用 rendering 模块的公开名。
+_names_from_label = names_from_label
+_appearance_summary = appearance_summary
+_fallback_line = fallback_line
+_render_appearance_cards = render_appearance_cards
+_render_character = render_character
+_describe_result = describe_result
+_render_source_error = render_source_error
+_diagnose_local_confirm = diagnose_local_confirm
+_render_diagnosis = render_diagnosis
+_render_probe = render_probe
+_status_lines = status_lines
+_limits_line = limits_line
+
 #: 注入标记。同时用于幂等判定与对用户的说明，改它要同步 README。
 INJECT_MARKER = "【角色识别】"
 #: 识图工具对外暴露的名字，供能力提示引用。
@@ -103,13 +172,7 @@ TOOL_NAMES = ("recognize_image", "query_character", "search_character_library", 
 #: 连续发图的间隔不该把整轮登记判成超时——否则图越多越容易半路挂掉。
 CHARACTER_ADD_IDLE_SECONDS = 300.0
 
-#: 每个会话保留的最近图片数。``/识图修正`` 不引用消息时用的就是这段历史——
-#: 只留最后一张的话，"不引用"就等于"只能补一张卡"，跟引用没区别。
-RECENT_IMAGE_LIMIT = 8
-#: 这段历史的有效时间窗。没有它会出事：十分钟前发的图会在下一次命令里被当成"刚发的"。
-RECENT_IMAGE_SECONDS = 900.0
-#: 保留图片记忆的会话数上限（总字节数另有上限，见 ``_latest_max_bytes``）。
-RECENT_IMAGE_SESSIONS = 64
+#: 会话最近图片记忆的三重上限与实现已迁入 ``imagememo.py``（``RecentImageStore``）。
 
 #: LLM 能力调用的 RPC 超时。Host 的 ``cap.call`` 默认只有 **30s**，而真机视觉模型实测
 #: 要 54.9s——SDK 的 ``ctx.llm.generate`` 转发时**没有传** ``timeout_ms``，于是每次都在
@@ -124,51 +187,20 @@ LLM_RPC_TIMEOUT_MS = 180_000
 #: 换通用小任务才有活路。
 COMPRESS_DEFAULT_TASK = "utils"
 
-#: 视觉请求的 ``max_tokens`` **运行期下限**。
+#: 触发自动整理的卡片数阈值（15 条硬上限的 85%，取整）。
 #:
-#: 真机实录（09-28）：`describe` 走默认 220 触顶、`identify` 按配置的 700 也触顶，两次都是
-#: "达到最大输出 token 限制"。要注意**推理模型的思考 token 也算在这个上限里**，所以
-#: "描述最多 100 字 + 3 个候选"这种看起来几百 token 就够的输出，700 照样会被截断。
-#:
-#: 截断的代价是**静默失败**：JSON 断在 evidence 中途 → 整条候选校验作废，用户只看到
-#: "识别没结果"。而多留上限不会多花钱（只按实际输出计费），所以这里设一个下限兜底，
-#: 用户真机已有的 ``max_tokens = 700`` 不必改配置就能生效。
-VISION_MAX_TOKENS_FLOOR = 1600
+#: 整理的价值只在**配额压力**下成立：``merged_cards[:15]`` 的硬上限会丢弃溢出的新卡
+#:（真机 10-01 心华登记：8 条新卡被丢），压缩腾出位置才有意义；没顶到上限时冗余只是
+#: 浪费配额，压缩纯属白花一次模型调用——还会跟记忆摘要等任务挤同一个 utils 任务，
+#: 真机 10-01 07:14 的整理超时正是发生在这种拥塞窗口里。
+COMPRESS_TRIGGER_THRESHOLD = 13
 
-#: 单图超时最多只能占整条消息预算的这个比例。**必须严格小于 1**。
-#:
-#: 真机踩过的不变量破坏：用户照着插件自己的提示把 ``image_timeout_seconds`` 调到了 120，
-#: 而 ``message_timeout_seconds`` 还是默认的 110——于是**单图超时永远不可能先触发**：
-#:   13:12:13 收到图 → 13:14:03（+110s）"单条消息识别超预算"
-#:                    → 13:14:18（+120s）那张图的任务才报"视觉请求超时"
-#: 表现就是"超预算"日志刷屏、图片白等，而真正该看到的"视觉超时"晚 15 秒才出现。
-#: 留出余量后，超时会先于预算触发，归因才清楚。
-MESSAGE_BUDGET_RESERVE_RATIO = 0.8
+#: 整理超时/失败后的自动重试延迟。拥塞窗口通常是几分钟级，一次延迟重试成本低、
+#: 救回率高；重试仍失败才通知用户（不通知的话用户会默认整理成功了）。
+COMPRESS_RETRY_DELAY_SECONDS = 300.0
 
-
-def effective_image_timeout(config: Any) -> float:
-    """按整条消息预算夹取后的单图超时。**生效值的唯一真相来源。**
-
-    做成模块级纯函数（而不是只留在插件方法里）是为了让 ``/识图状态`` 报的数与真正
-    用的数**必然一致**。真机踩过"说的和做的不一样"：配置写着 120、实际按 110 的预算走，
-    用户看完状态栏以为配置没生效，又去反复改配置。
-    """
-    configured = float(getattr(config.plugin, "image_timeout_seconds", 0.0) or 0.0)
-    budget = float(getattr(config.plugin, "message_timeout_seconds", 0.0) or 0.0)
-    if budget <= 0:
-        return configured
-    return max(1.0, min(configured, budget * MESSAGE_BUDGET_RESERVE_RATIO))
-
-
-def effective_max_tokens(config: Any) -> int:
-    """视觉请求实际使用的 ``max_tokens``（配置值与下限取大）。纯函数。"""
-    configured = int(getattr(config.vision, "max_tokens", 0) or 0)
-    return max(configured, VISION_MAX_TOKENS_FLOOR)
-
-#: 检索分的实测波动区间（2026-09-18 真机：同一张图、同一份卡片，分数在 0.34~0.40 之间漂，
-#: 因为 description 由视觉模型每次现生成、措辞一变向量就变）。阈值落进这个区间会表现为
-#: "同一张图时贴时不贴"——比设错更难查，因为它看起来像随机故障。所以状态里要喊出来。
-SCORE_JITTER_BAND = (0.30, 0.42)
+#: 视觉 ``max_tokens`` 下限与单图超时预算比例、``effective_*`` 生效值计算已随渲染层
+#: 一并迁入 ``rendering.py``（本文件顶部 re-export，``test_limits`` 等既有引用不变）。
 
 
 @dataclass
@@ -469,6 +501,20 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
 
     config_model = CharacterRecognizerConfig
 
+    def get_webui_config_schema(self, **kwargs) -> dict:
+        """覆写 SDK 的 WebUI 配置 Schema：做可视化模式的显示层补丁。
+
+        Runner 调这个方法拿配置页 Schema 且异常会被吞掉（变成空 Schema、
+        配置页整页空白），所以这里自己兜底：补丁失败就原样返回 SDK 输出。
+        """
+
+        schema = super().get_webui_config_schema(**kwargs)
+        try:
+            return _apply_webui_display_polish(schema)
+        except Exception:  # noqa: BLE001 —— 显示补丁失败绝不能让配置页变空白
+            logging.getLogger(__name__).exception("修正 WebUI 配置 Schema 失败，回退 SDK 原样输出")
+            return schema
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         # 必须最先调用：漏掉这一句会让整个 Runner 崩溃，而不是只让本插件失败。
         super().__init__(*args, **kwargs)
@@ -478,16 +524,20 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
         self._index = EmbeddingIndex()
         self._lock = asyncio.Lock()
         self._semaphore = asyncio.Semaphore(1)
-        self._tasks: set[asyncio.Task] = set()
+        #: 后台任务登记册（防僵尸/防异常未取/超预算取消），实现见 runtime.TaskRegistry。
+        #: ``_tasks`` 别名登记册内部的集合：既有测试直接 gather 它等后台任务收尾。
+        self._task_registry = TaskRegistry(log=self._log)
+        self._tasks = self._task_registry.tasks
         #: 视觉超时的建议每次加载只提示一次——反复刷同一条建议会淹掉别的日志。
         self._vision_timeout_hinted = False
         #: 另外两条**运行期夹取**也各只提示一次（见 ``_vision_max_tokens`` / ``_effective_image_timeout``）。
         self._vision_token_floor_hinted = False
         self._image_timeout_clamped_hinted = False
-        #: 会话 → [(图片, 标签, 收到时刻)]，保留最近若干张（见 RECENT_IMAGE_LIMIT）。
-        self._latest_images: dict[str, list[tuple[bytes, str, float]]] = {}
-        self._latest_bytes = 0
-        self._latest_max_bytes = 32 * 1024 * 1024
+        #: 会话最近图片记忆（/识图修正 不引用时吃这段历史），实现见 imagememo.py。
+        #: ``_latest_images`` 直接别名 store 内部的 dict：既有冒烟用例会绕过
+        #: ``_remember_image`` 直接塞条目，别名保证两条路径写的是同一份数据。
+        self._image_store = RecentImageStore()
+        self._latest_images = self._image_store.buffers
         self._pending_additions: dict[str, PendingAddition] = {}
         self._generation = 0
         self._embed_unavailable_until = 0.0
@@ -497,6 +547,8 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
         #: 最近一次识图的链路诊断，供 /识别探测 展开。""未识别""是个黑盒结论——
         #: 不记录岔路口，用户只能反复换图试，而真正的原因可能在检索、VLM 或限流。
         self._last_diagnosis: "dict[str, Any] | None" = None
+        #: 识别流水线编排（依赖注入，ctx 侧的适配以回调形式交给它）。
+        self._pipeline = self._build_pipeline()
 
     # ---------------------------------------------------------- 生命周期
 
@@ -520,12 +572,7 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
 
     async def on_unload(self) -> None:
         """插件卸载：取消后台任务并释放全部缓存，避免卸载后仍有 task 在跑。"""
-        for task in list(self._tasks):
-            if not task.done():
-                task.cancel()
-        if self._tasks:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
-        self._tasks.clear()
+        await self._task_registry.cancel_all()
         self._cache.clear()
         self._index.clear()
         self._breaker.reset()
@@ -741,36 +788,8 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
     # ---------------------------------------------------------- 反查源
 
     def _source_configs(self) -> "dict[str, SourceConfig]":
-        plugin = self.config.plugin
-        return {
-            "anime_trace": SourceConfig(
-                name="anime_trace",
-                enabled=self.config.anime_trace.enabled,
-                url=self.config.anime_trace.url,
-                timeout_seconds=self.config.anime_trace.timeout_seconds,
-                max_upload_bytes=self.config.anime_trace.max_upload_bytes,
-                max_candidates=self.config.anime_trace.max_candidates,
-            ),
-            "saucenao": SourceConfig(
-                name="saucenao",
-                enabled=self.config.saucenao.enabled,
-                url=self.config.saucenao.url,
-                timeout_seconds=self.config.saucenao.timeout_seconds,
-                max_upload_bytes=self.config.saucenao.max_upload_bytes,
-                api_key=self.config.saucenao.api_key,
-                max_candidates=self.config.saucenao.max_candidates,
-                confident_similarity=self.config.saucenao.confident_similarity,
-                weak_similarity=self.config.saucenao.weak_similarity,
-            ),
-            "trace_moe": SourceConfig(
-                name="trace_moe",
-                enabled=self.config.trace_moe.enabled,
-                url=self.config.trace_moe.url,
-                timeout_seconds=self.config.trace_moe.timeout_seconds,
-                max_upload_bytes=self.config.trace_moe.max_upload_bytes,
-                max_candidates=self.config.trace_moe.max_candidates,
-            ),
-        }
+        """三个反查源的配置映射，实现见 ``sources.source_configs_from``。"""
+        return source_configs_from(self.config)
 
     async def _collect_hits(self, image_bytes: bytes) -> "tuple[tuple[SourceHit, ...], list[str]]":
         """并发跑所有已启用的源，返回 (命中, 错误说明列表)。"""
@@ -928,245 +947,40 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
             note = f"无可用候选（{describe_vision_dropouts(result)}）"
         return names, note, result.raw, result.description
 
-    # ---------------------------------------------------------- 识别主流程
+    def _build_pipeline(self) -> RecognitionPipeline:
+        """组装识别流水线：把 ctx 侧的适配全部做成回调注入，编排层零 ctx。
+
+        实例只建一次即可——``*_provider`` 是闭包，每次运行时读的都是最新的实例属性
+        （``_cache`` 在配置热更时会被重建，捕获对象会拿到已被丢弃的那一个）。
+        """
+        return RecognitionPipeline(
+            PipelinePorts(
+                describe=self._describe,
+                identify=self._identify_candidates,
+                embed=self._embed_texts,
+                collect_hits=self._collect_hits,
+                log=self._log,
+                debug_log=lambda message, *args: self.ctx.logger.debug(message, *args),
+            ),
+            cache_provider=lambda: self._cache,
+            index_provider=lambda: self._index,
+            repository_provider=lambda: self._repository,
+            config_provider=lambda: self.config,
+            generation_provider=lambda: self._generation,
+            diagnosis_sink=self._record_diagnosis,
+        )
+
+    def _record_diagnosis(self, diag: dict) -> None:
+        """接收流水线产出的链路诊断（outputs → 插件状态），供 /识别探测 展开。"""
+        self._last_diagnosis = diag
 
     def _retrieval_options(self) -> RetrievalOptions:
-        cfg = self.config.retrieval
-        return RetrievalOptions(
-            max_prompt_characters=self.config.library.max_prompt_characters,
-            pinned_reserve=self.config.library.pinned_reserve,
-            embedding_enabled=cfg.embedding_enabled,
-            embed_batch_size=cfg.embed_batch_size,
-            weight_embedding=cfg.weight_embedding,
-            weight_keyword=cfg.weight_keyword,
-            boost_reverse_confirmed=cfg.boost_reverse_confirmed,
-            keyword_min_score=cfg.keyword_min_score,
-            embed_min_score=cfg.embed_min_score,
-        )
-
-    def _fusion_options(self) -> FusionOptions:
-        cfg = self.config.fusion
-        return FusionOptions(
-            auto_apply_single_source=cfg.auto_apply_single_source,
-            require_two_sources_for_auto=cfg.require_two_sources_for_auto,
-            conflict_min_confidence=cfg.conflict_min_confidence,
-            auto_apply_local_confirm=cfg.auto_apply_local_confirm,
-            saucenao_confident_similarity=self.config.saucenao.confident_similarity,
-            saucenao_weak_similarity=self.config.saucenao.weak_similarity,
-        )
-
-    def _resolver(self):
-        """名字 → 本地角色的解析函数，交给融合层做跨语言桥接。"""
-        repository = self._repository
-
-        def resolve(raw_name: str):
-            if repository is None:
-                return None
-            character = repository.resolve(raw_name)
-            if character is None:
-                return None
-            return character.character_id, character.name
-
-        return resolve
+        """检索参数（配置→参数的纯映射），实现见 pipeline.RecognitionPipeline。"""
+        return self._pipeline.retrieval_options()
 
     async def _recognize(self, image_bytes: bytes, *, chat_text: str = "") -> RecognitionResult:
-        """单张图片的完整识别流程。"""
-        if not image_bytes:
-            return RecognitionResult(description="图片未能读取", ok=False)
-        digest = sha256_hex(image_bytes)
-        cache_key = f"{self._generation}:{digest}"
-        diag: dict[str, Any] = {"cache": "未命中", "threshold": self.config.fusion.local_confirm_min_score}
-        if self.config.cache.enabled:
-            cached = self._cache.get(cache_key)
-            if cached is not None:
-                diag.update(
-                    cache="命中，复用上次结论（不重跑链路）",
-                    tier=cached.fusion.tier,
-                    label=cached.label,
-                    reason=cached.fusion.reason,
-                )
-                self._last_diagnosis = diag
-                return cached
-
-        # 真值判断会踩坑：空库的 bool() 是 False，语义上会被当成"没有库"。
-        characters = tuple(self._repository.characters) if self._repository is not None else ()
-
-        # 阶段一：先跑反查，再决定要不要独立的图片描述调用。
-        #
-        # 反查给出角色名信号且融合尚未确认时，describe 与 identify 两次视觉调用合并成
-        # 一次：identify 的输出本就含 description 字段（见 prompts 的 JSON 格式），让它
-        # 一趟把"描述 + 候选校验"都做了，省下一整趟 30~50s 的视觉调用。这条路径上检索
-        # 查询以反查名为主（Query.compose 里反查名重复加权），且被点名的角色有 pinned
-        # 保底，检索失去描述文本的影响可控。
-        hits, errors = await self._collect_hits(image_bytes)
-        preliminary = fuse(hits, resolve=self._resolver(), options=self._fusion_options())
-        merged_vision = (
-            self.config.vision.enabled
-            and bool(characters)
-            and self.config.library.enabled
-            and any(hit.gives_character for hit in hits)
-            and preliminary.tier != TIER_CONFIRMED
-        )
-        if merged_vision:
-            description = ""
-        else:
-            description = await self._describe(image_bytes)
-        diag["characters"] = len(characters)
-        diag["reverse"] = f"命中 {len(hits)} 条" if hits else "无命中"
-        diag["reverse_errors"] = list(errors)
-        if errors:
-            self._log("warning", "部分反查源失败：%s", "；".join(errors))
-        if self.config.plugin.debug and hits:
-            self.ctx.logger.debug("反查命中：\n%s", describe_hits(hits))
-
-        # 阶段二：相关性检索挑选候选
-        relationships: dict[str, str] = {}
-        retrieval = None
-        if characters and self.config.library.enabled:
-            retrieval = await retrieve(
-                characters,
-                Query(
-                    description=description,
-                    reverse_names=tuple(hit.raw_name for hit in hits if hit.gives_character),
-                    reverse_works=tuple(hit.work for hit in hits if hit.work),
-                    chat_text=chat_text,
-                ),
-                options=self._retrieval_options(),
-                embed=self._embed_texts,
-                index=self._index,
-                reverse_confidence=build_reverse_confidence(hits),
-            )
-            relationships = {
-                item.character.character_id: item.character.relationship
-                for item in retrieval.selected
-                if item.character.relationship
-            }
-            diag["retrieval_scores"] = [
-                (item.character.name, round(item.score, 3)) for item in retrieval.selected[:3]
-            ]
-            diag["retrieval"] = (
-                "、".join(f"{name} {score:.2f}" for name, score in diag["retrieval_scores"])
-                or "没有候选过线"
-            )
-            if retrieval.degraded:
-                diag["retrieval"] += "｜向量不可用，已降级为关键词检索"
-        else:
-            diag["retrieval"] = "角色库为空，没得挑" if not characters else "库检索被配置关闭"
-
-        # 阶段三：仅在有本地候选且反查尚未定论时，做一次候选校验
-        vision_names: "tuple[str, ...]" = ()
-        vision_note = "未调用"
-        vision_raw = ""
-        if retrieval is not None and retrieval.selected and self.config.vision.enabled:
-            if preliminary.tier != TIER_CONFIRMED:
-                catalog = [
-                    {
-                        "id": item.character.character_id,
-                        "name": item.character.name,
-                        "aliases": list(item.character.aliases),
-                        "work": item.character.work,
-                        # 给全量卡片：只送前 3 条时，模型可能因为看不到决定性特征而判"库里没有"。
-                        "appearance_cards": list(item.character.appearance_cards[:8]),
-                    }
-                    for item in retrieval.selected
-                ]
-                vision_names, vision_note, vision_raw, vision_description = await self._identify_candidates(
-                    image_bytes, catalog
-                )
-                if merged_vision:
-                    # 合并路径：这一次视觉调用同时承担"描述"职责；没产出描述才补一趟
-                    description = vision_description
-                    if not description:
-                        description = await self._describe(image_bytes)
-            else:
-                vision_note = "未调用（反查源已确认，不需要校验）"
-        elif retrieval is not None:
-            vision_note = "未调用（检索没有选出候选）"
-            if merged_vision:
-                # 检索没选出候选时 identify 不会跑，描述得补回来
-                description = await self._describe(image_bytes)
-        diag["vision"] = vision_note
-        diag["vision_names"] = list(vision_names)
-        diag["vision_raw"] = vision_raw
-
-        local_confirmed = self._local_confirmed(vision_names, retrieval)
-        fusion = fuse(
-            hits,
-            resolve=self._resolver(),
-            options=self._fusion_options(),
-            vlm_names=vision_names,
-            degraded=bool(retrieval and retrieval.degraded),
-            local_confirmed=local_confirmed,
-        )
-        label = fusion.label(relationships, limit=self.config.plugin.max_characters_per_image)
-        diag["local_confirmed"] = [[item[0], item[1]] for item in local_confirmed]
-        diag["reverse_candidates"] = [item.display_name for item in fusion.candidates]
-        # 真正会触发分歧否决的，只有能解析到库内角色的那些（库外名字多半是别名没登记）
-        confirmed_ids = {item[0] for item in local_confirmed}
-        diag["reverse_disputes"] = [
-            item.display_name for item in fusion.candidates
-            if item.character_id and item.character_id not in confirmed_ids
-        ]
-        diag["tier"] = fusion.tier
-        diag["label"] = label
-        diag["reason"] = fusion.reason
-        diag["description"] = bool(description)
-        self._last_diagnosis = diag
-        injection = ""
-        if self.config.injection.enabled and (retrieval is not None or fusion.works):
-            injection = build_knowledge_block(
-                # 注意取 .characters（Character 元组）而不是 .selected（ScoredCharacter 元组），
-                # 后者没有 name/work 这些字段，传错会得到空知识块且不报错。
-                characters=retrieval.characters if retrieval else (),
-                fusion=fusion,
-                options=self.config.injection,
-                max_chars=self.config.library.knowledge_block_max_chars,
-            )
-
-        result = RecognitionResult(
-            description=description or "",
-            label=label,
-            injection=injection,
-            image_hash=digest,
-            fusion=fusion,
-            ok=True,
-        )
-        if self.config.cache.enabled:
-            ttl = self.config.cache.ttl_seconds if label != UNRECOGNIZED_LABEL else self.config.cache.negative_ttl_seconds
-            if ttl > 0:
-                self._cache.put(cache_key, result, ttl_seconds=ttl)
-        return result
-
-    def _local_confirmed(
-        self, vision_names: "tuple[str, ...]", retrieval: Any
-    ) -> "list[tuple[str, str]]":
-        """筛出「本地库检索命中 **且** 视觉模型确认」的角色，交给融合层做限流兜底。
-
-        两个条件缺一不可：
-        1. 该角色在检索里排进了候选，且分数不低于 ``fusion.local_confirm_min_score``；
-        2. 视觉模型返回的名字能解析到**候选里的那个角色**——模型只看得到候选目录，
-           所以它报的名字落不进候选，说明这次回答不可用，不能拿来当证据。
-
-        这条通路的现实意义：免费反查源（AnimeTrace）会整段整段地限流，那期间反查
-        恒为空；没有它，用户自己攒的角色库在限流窗口里等于不存在。
-        """
-        if not vision_names or retrieval is None or not retrieval.selected:
-            return []
-        resolve = self._resolver()
-        scored = {item.character.character_id: item for item in retrieval.selected}
-        threshold = self.config.fusion.local_confirm_min_score
-        confirmed: "list[tuple[str, str]]" = []
-        for raw in vision_names:
-            resolved = resolve(str(raw).strip())
-            if resolved is None:
-                continue
-            character_id, canonical = resolved
-            candidate = scored.get(character_id)
-            if candidate is None or candidate.score < threshold:
-                continue
-            if all(item[0] != character_id for item in confirmed):
-                confirmed.append((character_id, canonical))
-        return confirmed
+        """单张图片的完整识别流程：编排见 ``pipeline.RecognitionPipeline.recognize``。"""
+        return await self._pipeline.recognize(image_bytes, chat_text=chat_text)
 
     async def _recognize_limited(self, image_bytes: bytes, generation: int, chat_text: str) -> "RecognitionResult | None":
         async with self._semaphore:
@@ -1181,48 +995,16 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
     ) -> "set[asyncio.Task]":
         """等这批识别任务到 ``budget`` 秒，**超预算的直接取消**，返回已完成的那批。
 
-        取消是必须的，不是"顺手清理"：超预算的图已经把结论交给 MaiBot（原图放行），它再跑
-        下去没有任何人会读它的结果，却会
-
-        * 继续占着 ``max_concurrency`` 的信号量——后面的消息全排在它后面，一条慢图能把
-          接下来几分钟的识图全拖住；
-        * 继续吃 Host 的模型配额与回退链（真机实录：13:14:03 判定超预算，那张图的任务到
-          13:14:18 才报"视觉请求超时"，白跑 15 秒）；
-        * 在日志里留下一句看起来像本轮结论、其实是弃单的报错。
-
-        早先的写法只 ``_track_task`` 登记不取消，等于把任务留成僵尸。
+        取消为什么是必须的（信号量占用/宿主配额/误导性日志三条理由），
+        见 ``runtime.TaskRegistry.await_with_budget`` 的完整说明。
         """
-        done, pending = await asyncio.wait(tasks, timeout=budget)
-        if not pending:
-            return done
-        # 一条日志说清整件事：以前是每个未完成任务各打一条，多图时刷屏还看不出总量。
-        self._log(
-            "warning",
-            "单条消息识别超预算（%.0fs）：%d 张图未完成，已取消识别并原样交给 MaiBot",
-            budget, len(pending),
-        )
-        for task in pending:
-            task.cancel()
-            self._track_task(task)
-        return done
+        return await self._task_registry.await_with_budget(tasks, budget)
 
     def _track_task(self, task: asyncio.Task) -> None:
-        self._tasks.add(task)
-        task.add_done_callback(self._retire_task)
+        self._task_registry.track(task)
 
     def _retire_task(self, task: asyncio.Task) -> None:
-        """任务结束后摘掉引用，并**把异常取出来**。
-
-        只 ``discard`` 不取异常的话，被取消/失败的任务会在 GC 时报
-        "Task exception was never retrieved"，看起来像又出了一条新故障。
-        """
-        self._tasks.discard(task)
-        if task.cancelled():
-            return
-        try:
-            task.exception()
-        except asyncio.CancelledError:  # pragma: no cover - 竞态兜底
-            pass
+        self._task_registry.retire(task)
 
     # ---------------------------------------------------------- 消息处理
 
@@ -1320,43 +1102,21 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
         return f"{session}:{user}"
 
     def _remember_image(self, key: str, image_bytes: bytes, label: str) -> None:
-        """记住这个会话刚识别过的图片，**保留一小段历史**。
+        """记住这个会话刚识别过的图片（三重上限：单会话张数/会话数/总字节数）。
 
-        为什么不是只留最后一张：``/识图修正`` 不引用消息时用的是"刚发的那几张"，
-        只留一张就永远只能补一张卡——那跟要求引用没区别。每条带时间戳，读的时候按
-        时间窗过滤（见 ``_recent_images``）。
-
-        三重上限：单会话张数、会话数、总字节数。字节数是必须的——一张图动辄几 MB，
-        不限就是几百 MB 常驻内存。dict 保序，所以"最早插入的"就是最该淘汰的。
+        实现见 ``imagememo.RecentImageStore``——存取逻辑已拆出，这里只做转发。
         """
-        buffer = self._latest_images.setdefault(key, [])
-        buffer.append((image_bytes, label, time.monotonic()))
-        self._latest_bytes += len(image_bytes)
-        while len(buffer) > RECENT_IMAGE_LIMIT:
-            data, _, _ = buffer.pop(0)
-            self._latest_bytes -= len(data)
-        while len(self._latest_images) > 1 and (
-            len(self._latest_images) > RECENT_IMAGE_SESSIONS
-            or self._latest_bytes > self._latest_max_bytes
-        ):
-            oldest = next(iter(self._latest_images))
-            if oldest == key:  # 只剩当前会话时不再淘汰，否则刚存进来的当场被扔
-                break
-            dropped = self._latest_images.pop(oldest)
-            self._latest_bytes -= sum(len(item[0]) for item in dropped)
-        self._latest_bytes = max(0, self._latest_bytes)
+        self._image_store.remember(key, image_bytes, label)
 
     def _recent_images(
-        self, key: str, limit: int = 1, window: float = RECENT_IMAGE_SECONDS
+        self, key: str, limit: int = 1, window: "float | None" = None
     ) -> "list[bytes]":
-        """取该会话最近 ``window`` 秒内的图片，最多 ``limit`` 张（新的在后）。
+        """取该会话最近 ``window`` 秒内的图片字节，最多 ``limit`` 张（新的在后）。
 
         时间窗是必要的：没有它，十分钟前发的图会在下一次 ``/识图修正`` 里被当成
         "刚发的"用上，而用户完全看不出这些卡是从哪张图来的。
         """
-        now = time.monotonic()
-        fresh = [item for item in self._latest_images.get(key, ()) if now - item[2] <= window]
-        return [item[0] for item in fresh[-max(1, limit):]]
+        return [item[0] for item in self._image_store.recent(key, limit, window)]
 
     def _latest_in_session(self, kwargs: dict, limit: int = 1) -> "list[bytes]":
         """按会话取最近发过的图（新→旧），最多 ``limit`` 张。
@@ -1366,7 +1126,7 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
         """
         prefix = f"{self._stream_id(kwargs)}:"
         images: "list[bytes]" = []
-        for key in reversed(list(self._latest_images)):
+        for key in reversed(self._image_store.session_keys()):
             if not key.startswith(prefix):
                 continue
             images.extend(reversed(self._recent_images(key, limit=limit)))
@@ -1739,7 +1499,7 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
             self._source_configs(),
             len(self._cache),
             len(self._index),
-            sum(len(items) for items in self._latest_images.values()),
+            self._image_store.total_count,
             self._embed_available(),
         )]
         models = await self._available_models()
@@ -1858,13 +1618,9 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
             f"已结束登记，共收了 {pending.images} 张图。\n"
             + _render_appearance_cards(cards, title=f"「{character.name}」")
         )
-        if self.config.library.compress_on_finish:
-            # 整理要跑几十秒（模型 30~55s），不能卡着回执不放。丢后台，完成后另发一条。
-            # 注意这**不解决** cap.call 的 30s RPC 超时——那个限制在宿主侧，放后台一样会断；
-            # 后台化省的是"你要干等 50 秒"，顺带让整理失败不占着命令的返回路径。
-            self._track_task(asyncio.create_task(
-                self._compress_and_report(stream_id, character.name, cards)
-            ))
+        if self._queue_compress_if_pressure(stream_id, character.name, cards):
+            # 整理要跑完宿主整条模型回退链（硬超时 120s），不能卡着回执不放。丢后台，
+            # 完成后另发一条。后台化省的是"你要干等两分钟"，顺带让整理失败不占命令的返回路径。
             reply += "\n（外观卡整理已在后台进行，完成后会另发一条）"
         reply += "\n要补卡可再 /角色添加 同名，或发图后 /识图修正"
         return True, reply, 2 if await self._reply(stream_id, reply) else 0
@@ -1946,6 +1702,10 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
             + "。\n"
             + _render_appearance_cards(list(updated.appearance_cards), title=f"「{updated.name}」")
         )
+        # 补卡路径同样适用配额压力触发：这条路径以前是覆盖缺口（从不触发整理），
+        # 而补卡恰恰是最容易顶到 15 条上限的操作。
+        if self._queue_compress_if_pressure(stream_id, updated.name, list(updated.appearance_cards)):
+            reply += "\n（外观卡已顶到上限边缘，整理已在后台进行，完成后会另发一条）"
         return True, reply, 2 if await self._reply(stream_id, reply) else 0
 
     @Command(
@@ -2105,15 +1865,60 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
             raise ValueError("角色库未初始化")
         return self._repository.append_appearance_cards(name, cards)
 
-    async def _compress_and_report(self, stream_id: str, name: str, cards: "list[str]") -> None:
+    def _queue_compress_if_pressure(self, stream_id: str, name: str, cards: "list[str]") -> bool:
+        """外观卡顶到上限边缘时排队后台整理。返回是否已排队（供回执决定是否承诺）。
+
+        只在**配额压力**下整理（``COMPRESS_TRIGGER_THRESHOLD`` = 15 条硬上限的 85%）：
+        没顶到上限时冗余只是浪费配额，压缩纯属白花一次模型调用，还会跟记忆摘要等任务
+        挤同一个 utils 任务——真机 10-01 07:14 的整理超时就发生在这种拥塞窗口里。
+        ``/结束角色添加`` 与 ``/识图修正`` 两条入库路径统一走这里。
+        """
+        if not self.config.library.compress_on_finish:
+            return False
+        if len(cards) < COMPRESS_TRIGGER_THRESHOLD:
+            return False
+        self._track_task(asyncio.create_task(
+            self._compress_and_report(stream_id, name, list(cards))
+        ))
+        return True
+
+    @staticmethod
+    def _compress_retryable(note: str) -> bool:
+        """这次整理失败值不值得自动重试一次。
+
+        只有**瞬态**失败值得：超时、请求失败、宿主未成功返回（多半是拥塞窗口，
+        几分钟后重试救回率高）。「跳过」「关闭」「未初始化」「被改动」「无法解析」
+        「缺少」是确定性结果，重试一百次也是同样的结局，别浪费配额。
+        """
+        if any(marker in note for marker in ("跳过", "关闭", "未初始化", "被改动", "无法解析", "缺少")):
+            return False
+        return any(marker in note for marker in ("超时", "失败", "未成功", "E_TIMEOUT"))
+
+    async def _compress_and_report(
+        self, stream_id: str, name: str, cards: "list[str]", *, retried: bool = False
+    ) -> None:
         """后台整理外观卡，跑完补一条消息。
 
-        整理要几十秒，``/结束角色添加`` 的回执不该陪着等。失败也发一条**简短**通知：
-        不发的话用户会默认整理成功了。
+        整理要跑完宿主整条模型回退链（硬超时 120s），``/结束角色添加`` 的回执不该陪着等。
+        瞬态失败先**延迟自动重试一次**（拥塞窗口通常几分钟级，一次重试成本低、救回率高），
+        重试仍失败才发通知——不发的话用户会默认整理成功了。
         """
         merged, note = await self._compress_cards(name, cards)
         if merged is None:
-            await self._reply(stream_id, f"「{name}」的外观卡未整理：{note}")
+            if not retried and self._compress_retryable(note):
+                self._log(
+                    "info", "外观卡整理未成功（%s），%.0f 秒后自动重试一次",
+                    note, COMPRESS_RETRY_DELAY_SECONDS,
+                )
+                await asyncio.sleep(COMPRESS_RETRY_DELAY_SECONDS)
+                # 等重试的这几分钟里卡片可能又变了，以库里的最新快照为准
+                # （``_compress_cards`` 内部也有快照校验，拿不到角色就保持原样）。
+                await self._compress_and_report(
+                    stream_id, name, self._known_cards(name), retried=True
+                )
+                return
+            suffix = "（已自动重试一次，仍失败）" if retried else ""
+            await self._reply(stream_id, f"「{name}」的外观卡未整理：{note}{suffix}")
             return
         await self._reply(
             stream_id,
@@ -2221,17 +2026,23 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
             cards=cards,
             provider=self.config.vision.provider,
             generate=self._generate,
-            # 整理是纯文本活，**不能沿用视觉任务的模型**（实测 54.9~56.8s，而 Host 的
-            # cap.call RPC 硬超时 30s）。配置留空就走 COMPRESS_DEFAULT_TASK。
+            # 整理是纯文本活，**不能沿用视觉任务的模型**（实测 54.9~56.8s）。
+            # 配置留空就走 COMPRESS_DEFAULT_TASK。
             task_name=self.config.library.compress_task_name or COMPRESS_DEFAULT_TASK,
             model_name="",  # 任务名已经决定了模型；再传视觉模型名会把小任务压回大模型
+            # 插件侧预算必须盖过**宿主整条模型回退链**的硬超时（120s），否则插件先放弃、
+            # 宿主还在跑回退——真机 10-01 07:14：插件 90s 预算放弃，宿主 07:14:51 才
+            # 120s 硬超时切下一个模型（mimo-v2.6-flash 本可救回）。与 RPC 层对齐到 180s。
+            timeout_seconds=LLM_RPC_TIMEOUT_MS / 1000,
         )
         if merged is None:
             self._log("info", "外观卡整理未采用：%s", note)
             if "超时" in note or "E_TIMEOUT" in note:
                 return None, (
-                    f"{note}；该任务上的模型太慢（Host 的 cap.call 硬超时 30s），"
-                    f"可在 library.compress_task_name 换更快的小任务，或关掉 compress_on_finish"
+                    f"{note}；超时分两层——Provider 连接超时（默认 30s）与宿主模型回退链"
+                    "硬超时（120s）。插件侧预算（180s）已覆盖回退链仍触顶，说明该任务上的"
+                    "模型或 Provider 本身太慢。可在 library.compress_task_name 换更快的"
+                    "小任务、调大该 Provider 的 timeout，或关掉 compress_on_finish"
                 )
             return None, note
         # 整理是慢活：这期间用户完全可能又补了卡（整理在后台跑时尤其如此）。
@@ -2299,15 +2110,20 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
         pending.touched()
         pending.images += len(batch)
         stored = list(saved.appearance_cards)
-        # 上限会**静默**吃掉卡片：已有的加本批若超过 15 条，最早的那些直接消失。
-        # 不报出来，用户只会看到"我明明又发了几张，卡怎么没变多"。
-        dropped = max(0, pending.cards + len(cards) - len(stored))
+        # 上限会**静默**吃掉卡片：已有的加本批若超过 15 条，``merged_cards[:15]`` 截掉的
+        # 是**最新**的那些（不是最早）。不报出来，用户只会看到"我明明又发了几张，卡怎么没变多"。
+        before = pending.cards
+        dropped = max(0, before + len(cards) - len(stored))
         pending.cards = len(stored)
+        # 报**净增**而不是生成数：生成 5 条但全与已有重复时，「+5」和总数没动放在一起自相矛盾。
+        net = pending.cards - before
         reply = (f"「{saved.name}」已累积 {pending.images} 张图、{pending.cards} 条外观卡"
-                 f"（{_appearance_summary(stored)}，本批 +{len(cards)}）")
+                 f"（{_appearance_summary(stored)}，本批净增 +{net}）")
         if failed:
             reply += f"，其中 {failed} 张没抽到卡"
-        if dropped:
+        if dropped and net == 0:
+            reply += f"，本批 {len(cards)} 条全部未入库（与已有重复，或超出 15 条上限）"
+        elif dropped:
             reply += f"，另有 {dropped} 条未入库（与已有重复，或超出 15 条上限）"
         reply += "。继续发图，发完用 /结束角色添加 收工。"
         await self._reply(stream_id, reply)
@@ -2341,276 +2157,91 @@ class CharacterRecognizerPlugin(MaiBotPlugin):
         return True, reply, 2 if await self._reply(stream_id, reply) else 0
 
 
-# ══════════════════════════════════════════════════════════════ 模块级辅助
+# ================================================================ WebUI 显示层补丁
+#
+# 可视化模式的 FieldRenderer（dashboard/src/routes/plugin-config.tsx:163-361，
+# 1.3.1 布局）按 ui_type 渲染控件时只输出 label / hint / placeholder，
+# **从不渲染 description**；本插件字段的填法说明都写在 description 里，
+# 不搬进 hint，用户在配置页上一个字都看不到（源代码模式才见得到）。
+# 这里只改展示元数据，不碰任何配置键与校验语义。
+
+#: 默认收起的 section：标题自带「可选 / 默认关闭」的功能节。收起后标题
+#: 与说明仍可见，点开即可配置，避免整页卡片全开淹没常用配置。
+_WEBUI_COLLAPSED_SECTIONS: frozenset = frozenset({"saucenao", "trace_moe"})
+
+#: 手工指定的 section 标题（键 = section 名）；仅在 SDK 输出标题等于
+#: 节名（未配置 __ui_label__）时采用。
+_WEBUI_SECTION_TITLES: dict = {}
+
+#: 手工指定的字段 label（键 = 字段名）；仅在自动推导不可用时采用。
+_WEBUI_LABEL_OVERRIDES: dict = {
+    "api_key": "API Key",
+    "embed_model_name": "embedding 模型名",
+}
 
 
-def _names_from_label(label: str) -> "list[str]":
-    """从 ``图片[角色A（关系）、角色B]`` 里抠出角色名。
+#: 推导 label 用的中文分隔符（取最靠左的一个）
+_WEBUI_CJK_SEPS = "。！？；，：（(、"
 
-    前缀长度按 ``len(prefix)`` 取，别写死数字：这里曾经写成 ``text[4:]``，而 ``"图片["``
-    只有 3 个字符，于是 ``"图片[未识别]"`` 被切出 ``"识别"``——它不等于 ``"未识别"``，
-    就被当成一个角色名去查库了。查不到所以没出事，但"未识别"这条路径等于从未被覆盖过。
+
+def _webui_label_from_description(description: str) -> str:
+    """从中文 description 里取第一小句当显示标题（取不到返回空串）。
+
+    在中英文标点里找**最靠左**的分隔符，取它前面的短语——通常是字段
+    本身的名字；超长时截到 12 字符并避免把英文单词截一半。
     """
-    prefix = "图片["
-    text = str(label or "")
-    if not text.startswith(prefix) or "]" not in text:
-        return []
-    body = text[len(prefix):text.index("]")]
-    if body == "未识别":
-        return []
-    names: list[str] = []
-    for item in body.split("、"):
-        name = item.split("（", 1)[0].strip()
-        if name:
-            names.append(name)
-    return names
+    text = (description or "").strip()
+    if not text:
+        return ""
+    cut = len(text)
+    for sep in _WEBUI_CJK_SEPS:
+        idx = text.find(sep)
+        if 0 < idx < cut:
+            cut = idx
+    text = text[:cut].strip()
+    if len(text) > 12:
+        text = text[:12]
+        if " " in text[4:]:
+            text = text[: text.rfind(" ")].rstrip() or text
+    while text and text[-1] in "（(\"“：:，,；;、":
+        text = text[:-1].rstrip()
+    return text if len(text) >= 2 else ""
 
 
-def _appearance_summary(cards: "Sequence[str]") -> str:
-    """一行类别计数，如「发色发型 2｜眼睛 1｜服装 3」。没有卡片时返回空串。"""
-    groups = group_appearance_cards(cards)
-    order = [*CORE_APPEARANCE_CATEGORIES, "配饰", "其他"]
-    return "｜".join(f"{name} {len(groups[name])}" for name in order if name in groups)
-
-
-def _fallback_line(config: Any) -> str:
-    """渲染"本地库兜底"这一行，顺手做一次阈值体检。
-
-    为什么要在状态里喊：这个阈值是从"0.55×向量 + 0.35×关键词"的加权和上取的，而那个和会
-    随 description 的措辞漂（实测 0.34~0.40）。**落在这个区间里的阈值是最坏的一种配置**
-    ——不是一直失败（那会被发现），而是时灵时不灵，让人以为是随机故障。所以只要落在区间
-    内就显式警告，并给出建议值。
-    """
-    line = "本地库兜底：" + ("开" if config.auto_apply_local_confirm else "关")
-    line += f"（检索分阈值 {config.local_confirm_min_score}）"
-    low, high = SCORE_JITTER_BAND
-    if config.auto_apply_local_confirm and low <= config.local_confirm_min_score <= high:
-        line += (f"\n  ⚠ 该阈值落在检索分的实测波动区间 {low}~{high} 内："
-                 "同一张图会时贴时不贴。建议改成 0（判据回到「进了候选池 + 视觉模型确认」这对双证）")
-    return line
-
-
-def _render_appearance_cards(cards: "Sequence[str]", title: str = "") -> str:
-    """把外观卡按类别分组渲染，并点名缺了哪一类。
-
-    平铺成一列时，用户看不出"三类齐不齐"——而那三类恰恰是插件核对候选时用的判据
-    （见 prompts 的「三类核对」）。所以分组与缺口提示不是排版装饰，是把内部判据外显：
-    缺「眼睛」就补一张能给到眼睛的图，而不是漫无目的地继续发图。
-    """
-    groups = group_appearance_cards(cards)
-    head = f"{title}外观卡" if title else "外观卡"
-    total = sum(len(items) for items in groups.values())
-    if not groups:
-        return f"{head} 0 条（还没有）"
-    order = [*CORE_APPEARANCE_CATEGORIES, "配饰", "其他"]
-    present = [name for name in order if name in groups]
-    lines = [f"{head} {total} 条（{_appearance_summary(cards)}）"]
-    for name in present:
-        lines.append(f"▸ {name}")
-        lines.extend(f"  · {card}" for card in groups[name])
-    missing = [name for name in CORE_APPEARANCE_CATEGORIES if name not in groups]
-    if missing:
-        lines.append(f"⚠ 缺「{'、'.join(missing)}」：再补一张能看到这些特征的图，核对时会稳很多")
-    return "\n".join(lines)
-
-
-def _render_character(character: Character, field: str = "auto") -> str:
-    """把角色渲染成给用户或模型看的多行文本。"""
-    if field == "persona" and character.persona:
-        return character.persona
-    if field == "work" and character.work:
-        return character.work
-    if field == "relationship" and character.relationship:
-        return character.relationship
-    if field == "aliases" and character.aliases:
-        return "、".join(character.aliases)
-    if field == "appearance" and character.appearance_cards:
-        return _render_appearance_cards(character.appearance_cards)
-    lines = [f"{character.name}"]
-    if character.aliases:
-        lines.append(f"别名：{'、'.join(character.aliases)}")
-    if character.work:
-        lines.append(f"作品：{character.work}")
-    if character.relationship:
-        lines.append(f"关系：{character.relationship}")
-    if character.persona:
-        lines.append(f"设定：{character.persona}")
-    if character.appearance_cards:
-        lines.append(_render_appearance_cards(character.appearance_cards))
-    if not character.persona and not character.work:
-        lines.append("（还没填设定：可用 /设置人设、/设置作品 补充）")
-    return "\n".join(lines)
-
-
-def _describe_result(result: RecognitionResult) -> str:
-    """把识别结论渲染成工具返回文本。"""
-    parts: list[str] = []
-    if result.label != UNRECOGNIZED_LABEL:
-        parts.append(f"识别结果：{result.label}")
-    elif result.fusion.candidates:
-        names = "、".join(item.display_name for item in result.fusion.candidates[:3])
-        parts.append(f"没能确认角色（候选：{names}，仅单源命中，未采信）")
-    else:
-        parts.append("没能识别出角色")
-    if result.fusion.reason:
-        parts.append(f"依据：{result.fusion.reason}")
-    if result.fusion.works:
-        parts.append(f"可能出自：{'、'.join(result.fusion.works[:3])}")
-    if result.description:
-        parts.append(f"图片内容：{result.description}")
-    if result.fusion.conflict:
-        parts.append("注意：多个反查源给出了互相矛盾的结果，请如实说明不确定。")
-    return "\n".join(parts)
-
-
-def _render_source_error(detail: str) -> str:
-    """把一句源错误翻译成"下一步该做什么"。
-
-    最关键的是把**限流**和**无命中**分开：用户看到"无命中"会理解成"这张图里没有
-    角色"，于是反复重发同一张图——而 429 恰恰是"越试越糟"的失败。所以限流必须显式
-    点出来，并给出等待建议。纯函数，可离线单测。
-    """
-    text = str(detail or "").strip()
-    if "被限流" in text or "429" in text:
-        return f"{text} → 反查源限流，等一两分钟再试；连续失败会自动熔断，冷却后恢复"
-    if "熔断" in text:
-        return f"{text} → 该源已暂停，冷却结束会自动恢复"
-    if "超时" in text:
-        return f"{text} → 网络超时，可稍后重试"
-    return text
-
-
-def _diagnose_local_confirm(diag: dict) -> str:
-    """说清楚兜底通路这次为什么没救回这张图。
-
-    "未识别"最容易被读成"库里没有这个人"，但实际的堵点有四个，处理方式完全不同：
-    反查源没查成 / 检索没选中 / 检索分不够 / 视觉模型没确认。把这四个岔路口分开报，
-    用户才知道该去调阈值、去补外观卡，还是去修模型配置。
-    """
-    if diag.get("tier") == TIER_LOCAL:
-        return "已触发（这次就是靠它贴上的标签）"
-    label = str(diag.get("label") or "")
-    if label and label != UNRECOGNIZED_LABEL:
-        return "未使用（反查源自己给出了结论）"
-    if diag.get("local_confirmed"):
-        return "条件已满足（结论见上方档位）"
-    names = [str(item) for item in (diag.get("vision_names") or ())]
-    if not names:
-        # 把视觉模型那一步自己报的原因带出来（模型没给候选 / 判为库外 / 有冲突特征 / 证据不足），
-        # 否则用户只会看到"未确认"，然后去改没错的那一环。
-        return f"未触发：{diag.get('vision', '视觉模型没有确认任何候选')}（双证缺一半）"
-    scores = {str(name): float(score) for name, score in (diag.get("retrieval_scores") or ())}
-    threshold = float(diag.get("threshold") or 0.0)
-    # 只有**低于**阈值的才算被阈值挡住。分数过线却报"没过阈值"，会把人骗去调一个
-    # 本来就没问题的参数。
-    below = [f"{name} {scores[name]:.2f}" for name in names if name in scores and scores[name] < threshold]
-    if below:
-        return (
-            f"未触发：模型确认了 {'、'.join(below)}，但检索分没过阈值 "
-            f"{threshold} → 可下调 fusion.local_confirm_min_score"
-        )
-    missing = [name for name in names if name not in scores]
-    if missing:
-        return f"未触发：模型确认的 {'、'.join(missing)} 不在检索候选里（检索没把它选出来）"
-    disputes = [str(item) for item in (diag.get("reverse_disputes") or ())]
-    if disputes:
-        return (
-            f"未触发：模型确认了 {'、'.join(names)}，但反查源指向库内另一个角色 "
-            f"{'、'.join(disputes)}，分歧时不贴（错贴一个人名比不贴更伤）"
-        )
-    return "未触发：双证均已满足但结论未生效，请把本段诊断回贴给开发者"
-
-
-def _render_diagnosis(diag: "dict | None") -> str:
-    """把最近一次识图的链路诊断渲染成可读的几行。"""
-    if not diag:
-        return "  还没有识图记录：先在本会话发一张图，再回来按一次。"
-    names = "、".join(str(item) for item in (diag.get("vision_names") or ()))
-    lines = [
-        f"  缓存：{diag.get('cache', '未知')}",
-        f"  反查源：{diag.get('reverse', '未跑')}"
-        + ("" if diag.get("description", True) else "｜图片描述为空（视觉通道没跑通）"),
-        f"  角色库：{diag.get('characters', 0)} 个角色｜本地检索：{diag.get('retrieval', '未跑')}",
-        f"  视觉候选校验：{diag.get('vision', '未跑')}" + (f"（{names}）" if names else ""),
-        f"  判定档位：{diag.get('tier', '?')}｜标签：{diag.get('label', '')}",
-    ]
-    for item in diag.get("reverse_errors") or ():
-        lines.append(f"    · {_render_source_error(str(item))}")
-    raw = str(diag.get("vision_raw") or "").strip().replace("\n", " ")
-    if raw:
-        lines.append(f"  视觉模型原始输出：{raw[:300]}" + ("…" if len(raw) > 300 else ""))
-    if diag.get("reason"):
-        lines.append(f"  依据：{diag['reason']}")
-    lines.append("  本地库兜底通路：" + _diagnose_local_confirm(diag))
-    return "\n".join(lines)
-
-
-def _render_probe(summary: dict) -> str:
-    if not summary.get("ok"):
-        return f"探测失败（{summary.get('error')}）"
-    parts = [f"顶层字段 {summary.get('top_level_keys')}"]
-    for key in ("results_count", "data_count", "result_count"):
-        if key in summary:
-            parts.append(f"{key.replace('_count', '')}={summary[key]}")
-    if "characters_populated_of_10" in summary:
-        parts.append(f"前 10 条里 characters 非空的：{summary['characters_populated_of_10']}")
-    if "has_anilist" in summary:
-        parts.append(f"含 anilist 元数据：{summary['has_anilist']}")
-    return "；".join(str(item) for item in parts)
-
-
-def _status_lines(config: Any, repository: Any, source_configs: dict, cache_size: int,
-                  index_size: int, image_count: int, embed_available: bool) -> str:
-    """状态摘要。降级状态必须外显，否则用户会以为向量检索在工作。
-
-    ``repository`` 的真假判断必须用 ``is None``，**不能用真值测试**：
-    ``CharacterRepository`` 定义了 ``__len__``，空库的 ``bool()`` 就是 ``False``，
-    于是"库是空的"会被报成"未初始化"。这两件事的排查方向完全相反——前者去
-    ``/角色添加`` 建卡就行，后者才要怀疑数据目录不可写。用真值测试等于把用户
-    引到错误的方向上，还会白翻一遍启动日志。
-    """
-    if repository is None:
-        library_line = "角色库：未初始化（数据目录不可用，见启动日志）"
-    else:
-        library_line = f"角色库：{len(repository)} 个角色（{repository.path.name}）"
-        if not len(repository):
-            library_line += "｜库为空：先 /角色添加 建第一张卡"
-    lines = [
-        library_line,
-        f"识别：{'开' if config.plugin.enabled else '关'}｜"
-        f"视觉：{config.vision.provider if config.vision.enabled else '关'}｜"
-        f"知识注入：{'开' if config.injection.enabled else '关'}",
-        f"候选上限：{config.library.max_prompt_characters}｜反查预留：{config.library.pinned_reserve}",
-        _limits_line(config),
-        "反查源：" + "、".join(
-            f"{name}{'开' if cfg.enabled else '关'}" for name, cfg in source_configs.items()
-        ),
-        "单源自动贴标签：" + ("开" if config.fusion.auto_apply_single_source else "关（更安全）"),
-        _fallback_line(config.fusion),
-        f"缓存：{cache_size} 条｜向量索引：{index_size} 条｜最近图片记忆：{image_count} 条",
-        "向量检索：" + ("可用" if embed_available else "不可用，已降级为关键词检索"),
-    ]
-    return "\n".join(lines)
-
-
-def _limits_line(config: Any) -> str:
-    """把**生效的**视觉限额写进状态，并标出它与配置不一致的地方。
-
-    这一行的存在理由全是真机踩出来的：用户按提示把 ``image_timeout_seconds`` 调到 120、
-    而 ``max_tokens`` 还留着 700，两处都是"配了但不生效"（前者被预算夹取、后者被下限抬走）。
-    不把生效值报出来，用户看完状态栏会以为配置没生效，然后反复改配置——越改越远。
-    """
-    text = (
-        f"视觉限额：单图超时 {effective_image_timeout(config):.0f}s"
-        f"（总预算 {config.plugin.message_timeout_seconds:.0f}s）"
-        f"｜max_tokens {effective_max_tokens(config)}"
-    )
-    notes: list[str] = []
-    if effective_image_timeout(config) < float(config.plugin.image_timeout_seconds or 0.0):
-        notes.append("超时已被消息预算夹取")
-    if effective_max_tokens(config) > int(config.vision.max_tokens or 0):
-        notes.append("max_tokens 低于下限已被抬高")
-    return text + ("｜" + "、".join(notes) if notes else "")
+def _apply_webui_display_polish(schema: dict) -> dict:
+    """把 description 抄进 hint、补中文 label / 节标题、收起可选功能节。"""
+    if not isinstance(schema, dict):
+        return schema
+    sections = schema.get("sections")
+    if not isinstance(sections, dict):
+        return schema
+    for name, section in sections.items():
+        if not isinstance(section, dict):
+            continue
+        if name in _WEBUI_COLLAPSED_SECTIONS:
+            section["collapsed"] = True
+        title = section.get("title")
+        if not title or title == name:
+            new_title = _WEBUI_SECTION_TITLES.get(name) or _webui_label_from_description(
+                section.get("description") or ""
+            )
+            if new_title and new_title != name:
+                section["title"] = new_title
+        for fname, field in (section.get("fields") or {}).items():
+            if not isinstance(field, dict):
+                continue
+            if fname == "config_version":
+                field["hidden"] = True  # 插件自维护字段：可视化模式不渲染，源代码模式仍可见
+            if not field.get("hint") and field.get("description"):
+                field["hint"] = field["description"]
+            label = field.get("label")
+            if (not label or label == fname) and field.get("description"):
+                new_label = _WEBUI_LABEL_OVERRIDES.get(fname) or _webui_label_from_description(
+                    field["description"]
+                )
+                if new_label and new_label != fname:
+                    field["label"] = new_label
+    return schema
 
 
 def create_plugin() -> CharacterRecognizerPlugin:
