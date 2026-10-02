@@ -661,14 +661,16 @@ def check_incremental_card_extraction_gets_existing_cards() -> list[str]:
 def check_finish_compresses_cards_and_keeps_data_on_failure() -> list[str]:
     """结束登记时整理一遍：**在后台跑**、写回是**替换**、失败时卡片原样不动。
 
-    整理是慢活（模型 30~55s），回执不该陪着等——所以它被丢到后台，完成后另发一条通知。
+    整理要跑完宿主整条模型回退链（硬超时 120s），回执不该陪着等——所以它被丢到后台，
+    完成后另发一条通知。触发前提是卡片数顶到上限边缘（``COMPRESS_TRIGGER_THRESHOLD``），
+    所以这里的卡片数必须 ≥ 阈值。
     """
     failures: list[str] = []
     runner = Runner(config_overrides={"library.admin_ids": ["10001"]})
     asyncio.run(runner.plugin.on_load())
     try:
         plugin = runner.plugin
-        cards = [f"浅蓝色长发变体 {index}" for index in range(6)] + [
+        cards = [f"浅蓝色长发变体 {index}" for index in range(9)] + [
             "金色瞳孔", "深蓝色制服上衣", "白色百褶裙", "黑色玛丽珍鞋",
         ]
         admin = {"stream_id": "stream-1", "user_id": "10001"}
@@ -962,15 +964,17 @@ def check_compress_uses_general_task_not_vision_model() -> list[str]:
     """整理必须走通用小任务，不能挂在视觉大模型上。
 
     真机实测：挂在视觉任务上单次 54.9~56.8s，而 Host 的 ``cap.call`` RPC 硬超时只有 **30s**
-    ——插件侧把超时调到 90s 也没用，先断的是 RPC 那一层。所以整理默认走 ``utils``；
-    并且**不能再传视觉模型名**，那会把小任务压回大模型。
+    ——插件侧把超时调大也没用，先断的是 RPC 那一层（后由 ``_generate`` 显式覆盖到 180s）。
+    所以整理默认走 ``utils``；并且**不能再传视觉模型名**，那会把小任务压回大模型。
+    卡片数要 ≥ ``COMPRESS_TRIGGER_THRESHOLD``，否则按配额压力规则根本不触发整理。
     """
     failures: list[str] = []
     runner = Runner(config_overrides={"library.admin_ids": ["10001"]})
     asyncio.run(runner.plugin.on_load())
     try:
         plugin = runner.plugin
-        cards = [f"卡片 {index}" for index in range(10)]
+        plugin_module = sys.modules.get(type(plugin).__module__)
+        cards = [f"卡片 {index}" for index in range(plugin_module.COMPRESS_TRIGGER_THRESHOLD)]
         plugin._repository.upsert(name="鸣澜", appearance_cards=cards)
         plugin._pending_additions.clear()
         admin = {"stream_id": "stream-1", "user_id": "10001"}
@@ -991,6 +995,117 @@ def check_compress_uses_general_task_not_vision_model() -> list[str]:
                 failures.append(f"整理没有走通用小任务：task_name={calls[-1].get('task_name')!r}")
             if calls[-1].get("model_name"):
                 failures.append("整理不该传视觉模型名，那会把小任务压回大模型")
+    finally:
+        asyncio.run(runner.plugin.on_unload())
+    return failures
+
+
+def check_compress_skips_below_threshold() -> list[str]:
+    """外观卡没顶到上限边缘时**不触发**整理，回执也不许承诺「在后台进行」。
+
+    整理的价值只在配额压力下成立（15 条硬上限会丢弃溢出的新卡）；没顶到上限时压缩
+    纯属白花一次模型调用，还会跟记忆摘要等任务挤同一个 utils 任务（真机 10-01 07:14
+    的整理超时正是这种拥塞窗口里的结构性受害）。回执承诺了不做比不做更糟。
+    """
+    failures: list[str] = []
+    runner = Runner(config_overrides={"library.admin_ids": ["10001"]})
+    asyncio.run(runner.plugin.on_load())
+    try:
+        plugin = runner.plugin
+        plugin_module = sys.modules.get(type(plugin).__module__)
+        cards = [f"卡片 {index}" for index in range(plugin_module.COMPRESS_TRIGGER_THRESHOLD - 1)]
+        plugin._repository.upsert(name="鸣澜", appearance_cards=cards)
+        plugin._pending_additions.clear()
+        admin = {"stream_id": "stream-1", "user_id": "10001"}
+        asyncio.run(plugin.cmd_character_add(**admin, matched_groups={"name": "鸣澜"}))
+        runner.host.reset()
+        reply = asyncio.run(plugin.cmd_character_add_done(**admin))
+        if "已在后台进行" in reply[1]:
+            failures.append(f"未顶格不该承诺后台整理：{reply[1]}")
+        calls = runner.host.calls_of("llm.generate")
+        if calls:
+            failures.append(f"未顶格不该发起整理调用：{calls}")
+    finally:
+        asyncio.run(runner.plugin.on_unload())
+    return failures
+
+
+def check_compress_triggers_at_threshold() -> list[str]:
+    """外观卡顶到上限边缘（≥ 阈值）才触发后台整理。"""
+    failures: list[str] = []
+    runner = Runner(config_overrides={"library.admin_ids": ["10001"]})
+    asyncio.run(runner.plugin.on_load())
+    try:
+        plugin = runner.plugin
+        plugin_module = sys.modules.get(type(plugin).__module__)
+        cards = [f"卡片 {index}" for index in range(plugin_module.COMPRESS_TRIGGER_THRESHOLD)]
+        plugin._repository.upsert(name="鸣澜", appearance_cards=cards)
+        plugin._pending_additions.clear()
+        admin = {"stream_id": "stream-1", "user_id": "10001"}
+        asyncio.run(plugin.cmd_character_add(**admin, matched_groups={"name": "鸣澜"}))
+        runner.host.returns["llm.generate"] = {
+            "success": True, "model": "fake",
+            "response": json.dumps({"appearance_cards": ["甲", "乙"]}, ensure_ascii=False),
+        }
+        runner.host.reset()
+
+        async def drive() -> str:
+            reply = await plugin.cmd_character_add_done(**admin)
+            await asyncio.gather(*list(plugin._tasks), return_exceptions=True)
+            return reply[1]
+
+        text = asyncio.run(drive())
+        if "已在后台进行" not in text:
+            failures.append(f"顶格时回执没有说明整理在后台进行：{text}")
+        if not runner.host.calls_of("llm.generate"):
+            failures.append("顶格时没有发起整理调用")
+    finally:
+        asyncio.run(runner.plugin.on_unload())
+    return failures
+
+
+def check_compress_retries_once_on_failure() -> list[str]:
+    """整理瞬态失败要**延迟自动重试一次**，仍失败才通知；确定性失败不重试。
+
+    真机实录（10-01 07:14）：整理超时发生在拥塞窗口（同一分钟记忆摘要也超时），是
+    结构性受害而非偶发——几分钟后重试救回率很高。但只许重试一次：无限重试会把
+    拥塞窗口滚成风暴。测试里把 5 分钟延迟拨到 0（模块常量在运行期读取，可打桩）。
+    """
+    failures: list[str] = []
+    runner = Runner(config_overrides={"library.admin_ids": ["10001"]})
+    asyncio.run(runner.plugin.on_load())
+    try:
+        plugin = runner.plugin
+        plugin_module = sys.modules.get(type(plugin).__module__)
+        cards = [f"卡片 {index}" for index in range(plugin_module.COMPRESS_TRIGGER_THRESHOLD)]
+        plugin._repository.upsert(name="鸣澜", appearance_cards=cards)
+        original_delay = plugin_module.COMPRESS_RETRY_DELAY_SECONDS
+        plugin_module.COMPRESS_RETRY_DELAY_SECONDS = 0.01
+        runner.host.reset()
+        try:
+            # 瞬态失败（Provider 超时）：必须恰好重试一次，通知里说明已重试
+            runner.host.returns["llm.generate"] = {
+                "success": False, "error": "provider 网络连接超时", "model": "fake",
+            }
+            asyncio.run(plugin._compress_and_report("stream-1", "鸣澜", cards))
+        finally:
+            plugin_module.COMPRESS_RETRY_DELAY_SECONDS = original_delay
+        attempts = runner.host.calls_of("llm.generate")
+        if len(attempts) != 2:
+            failures.append(f"瞬态失败应自动重试一次（共 2 次尝试），实际 {len(attempts)} 次")
+        texts = runner.host.sent_texts
+        if not any("已自动重试" in text for text in texts):
+            failures.append(f"重试仍失败的通知没有说明已重试：{texts}")
+
+        # 确定性失败（模型输出不是 JSON）：不许重试，直接通知
+        runner.host.reset()
+        runner.host.returns["llm.generate"] = {
+            "success": True, "response": "这不是 JSON", "model": "fake",
+        }
+        asyncio.run(plugin._compress_and_report("stream-1", "鸣澜", cards))
+        attempts = runner.host.calls_of("llm.generate")
+        if len(attempts) != 1:
+            failures.append(f"确定性失败不该重试（应只尝试 1 次），实际 {len(attempts)} 次")
     finally:
         asyncio.run(runner.plugin.on_unload())
     return failures
@@ -1290,6 +1405,9 @@ CHECKS = [
     ("抽卡带已有卡片（防重复）", check_incremental_card_extraction_gets_existing_cards),
     ("结束登记整理卡片（失败保原样）", check_finish_compresses_cards_and_keeps_data_on_failure),
     ("整理走通用小任务（不挂视觉模型）", check_compress_uses_general_task_not_vision_model),
+    ("整理未顶格不触发（不承诺不调用）", check_compress_skips_below_threshold),
+    ("整理顶格才触发（配额压力）", check_compress_triggers_at_threshold),
+    ("整理瞬态失败自动重试一次", check_compress_retries_once_on_failure),
     ("LLM 调用显式带 RPC 超时", check_llm_calls_carry_explicit_rpc_timeout),
     ("视觉超时分层与提示", check_vision_timeout_layering),
     ("单图超时按消息预算夹取", check_image_timeout_is_clamped_to_message_budget),

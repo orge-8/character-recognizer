@@ -49,7 +49,7 @@ data/plugins/org.mai-mai.character-recognizer/characters.json
 | `plugin` | `enabled`、`max_images_per_message`、`max_characters_per_image` | 识别开关与单消息预算 |
 | `vision` | `provider`、`task_name` | `host`（默认）复用 MaiBot 已配置的视觉任务，**不需要再填密钥**；`gemini` / `openai` 才需要 `api_key` 与 `base_url` |
 | `library` | `admin_ids`、`max_prompt_characters`、`pinned_reserve` | 管理员列表；进提示词的候选上限；为反查命中的角色预留的候选位数 |
-| `library` | `compress_on_finish` | 默认开：结束登记时整理一遍外观卡（合并同类重复说法，保留造型差异与细节；失败保持原样） |
+| `library` | `compress_on_finish` | 默认开：外观卡**攒到 13 条**（硬上限 15 的 85%）才触发整理，低于阈值不跑；合并同类重复说法，保留造型差异与细节，失败保持原样 |
 | `library` | `compress_task_name` | 整理用的 Host 模型任务名，默认 `utils`（纯文本活，别占视觉大模型） |
 | `retrieval` | `embedding_enabled`、各 `weight_*` | 向量检索开关与打分权重。向量不可用时自动降级为关键词检索 |
 | `anime_trace` | `enabled`、`url` | **默认启用**，免费、无需密钥 |
@@ -187,8 +187,9 @@ LLM 工具（无需管理员）：`recognize_image`、`query_character`、`searc
 
 一份好卡应当**三类都齐**：发色发型、眼睛、服装主调。理由不只是卡片更全——插件核对候选时
 正是按这三类判的（见「贴错了角色」）。回执会按类别列出并点名缺口，缺哪类补哪类即可。
-外观卡上限 15 条、精确去重，超出会丢最早的——**被丢掉多少会写在回执里**（`另有 N 条未入库`），
-不然你只会看到"又发了几张，卡却没变多"。
+外观卡上限 15 条、精确去重，超出会丢最早的——**丢了多少一定写在回执里**，不然你只会看到
+"又发了几张，卡却没变多"。回执报的是**净增**口径（`本批净增 +N`，已经扣掉了本批与已有的重复）；被丢的是部分还是全部，回执也分开说：部分写 `另有 N 条未入库`，一批**一条都没进去**
+则不写含糊的"+0"，而是直接说明 `本批 N 条全部未入库（与已有重复，或超出 15 条上限）`。
 
 ### 它不会越攒越重复
 
@@ -197,7 +198,15 @@ LLM 工具（无需管理员）：`recognize_image`、`query_character`、`searc
 | 时机 | 做法 |
 |---|---|
 | 每次抽卡 | 提示词里带上**库里已有的卡片**，只让模型输出没覆盖到的新特征（没有新特征就输出空数组） |
-| `/结束角色添加` | 再花一次调用把同类的重复说法合并掉（`library.compress_on_finish`，默认开） |
+| 攒到配额压力（≥ 13 条） | 花一次调用把同类的重复说法合并掉（`library.compress_on_finish`，默认开） |
+
+整理不是"每次结束登记都跑"，而是**卡数达到硬上限 15 的 85%（13 条）才排队**：刚起步的库根本
+还没攒出冗余，压了也压不出东西，白白让你多等几十秒。`/结束角色添加` 与 `/识图修正` 都会检查
+这个阈值，共用同一套排队逻辑——改完属性回头改 `/识图修正` 也一样能受益。
+
+失败的**重试只留给瞬态原因**：超时、调用失败这类，5 分钟后自动重试一次；而"模型输出不合规"
+"条数没减少""整理期间卡片被改动""写回失败"属于确定性失败，**不会重试**——同样的输入再来
+一次还是同样的结果，重试只是把配额和你的耐心再烧一遍。
 
 合并有**三条写死在提示词里**的硬约束，外加一道不依赖模型自觉的兜底：
 
@@ -215,7 +224,7 @@ LLM 工具（无需管理员）：`recognize_image`、`query_character`、`searc
 换句话说：**冗余只是浪费配额，丢细节直接降低准确率**。所以宁可压得少，也不压掉信息；
 整理结果明显不合理（条数没减少、或少于 3 条）时一律不采用，调用失败也保持原样。
 
-**它在后台跑**：整理要几十秒，`/结束角色添加` 不会卡着回执等它 —— 卡片清单立刻返回，
+**它在后台跑**：整理要几十秒，触发它的那条命令不会卡着回执等 —— 卡片清单立刻返回，
 整理完成后另发一条通知（成功写「15 → 9 条」并附新清单，失败也只报一行原因）。
 整理期间你要是又补了卡，本次结果会被**丢弃**而不是覆盖（旧快照盖掉新卡片是不可接受的）。
 
@@ -396,10 +405,34 @@ bash /c/Users/38160/Desktop/tools/maibot-devkit/gate.sh /c/Users/38160/Desktop/c
 ```
 
 - `plugin.py` 之外的模块**不许出现 `self.ctx`**：静态检查只扫描 `plugin.py` 推导能力名，
-  其它模块里写 ctx 会"静态检查全绿、真机拒绝授权"。
+  其它模块里写 ctx 会"静态检查全绿、真机拒绝授权"。这条由 `tests/test_repository.py`
+  的用例守着（扫所有非 `plugin.py` 模块里的 ctx 字面量）。
 - `plugin.py` 不写 `from __future__ import annotations`（pydantic 解析配置模型会失败）。
 - 装饰器必须**紧贴**其后的 `def`；组件数由 `tests/smoke_test.py` 的清单断言守住。
 - 基线：MaiBot Host 1.2.0–1.99.99 + `maibot-plugin-sdk` 2.8.0。
+
+模块按职责分层，彼此都不认识宿主（`plugin.py` 顶部的 docstring 有同一张表）：
+
+| 层 | 模块 |
+|---|---|
+| 文本 / 数据模型 | `textutil`、`models` |
+| 检索与融合 | `retrieval`、`fusion` |
+| 取图与近期图记忆 | `imaging`、`imagememo` |
+| 角色库与反查源 | `repository`、`sources` |
+| 运行时（缓存 / 熔断 / 任务登记） | `runtime` |
+| 视觉与提示词 | `vision`、`prompts` |
+| 渲染（结果 → 用户可见文案） | `rendering` |
+| 识别编排 | `pipeline` |
+| 结果回写 | `inject` |
+
+两条约定是为可测性付的成本，改动时别绕过去：
+
+- **跨模块依赖走 provider 闭包**：`PipelinePorts` 里的 `cache_provider` / `index_provider` 等是
+  `Callable[[], T]`，不是实例本身。因为 `self._cache` 这类成员会被 `_rebuild_runtime` 重建，
+  捕获实例等于长期持有过期引用。
+- **时间源可注入**：凡涉及过期 / 冷却的逻辑（`TTLCache`、`CircuitBreaker`、`RecentImageStore`）
+  都接受 `clock: Callable[[], float] = time.monotonic`。测试灌假时钟就能验证"第 301 秒该过期"，
+  不必真的 `sleep`。
 
 ## 许可
 

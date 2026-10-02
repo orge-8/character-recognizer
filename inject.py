@@ -39,24 +39,6 @@ def build_system_item(text: str, *, item_id: str | None = None) -> dict[str, Any
     }
 
 
-def _text_of(item: Any) -> str:
-    if isinstance(item, str):
-        return item
-    if not isinstance(item, dict):
-        return ""
-    chunks: list[str] = []
-    parts = item.get("parts")
-    if isinstance(parts, list):
-        for part in parts:
-            if isinstance(part, dict) and part.get("type") == "text":
-                chunks.append(str(part.get("text") or ""))
-    if not chunks:
-        content = item.get("content")
-        if isinstance(content, str):
-            chunks.append(content)
-    return "".join(chunks)
-
-
 def has_marker(container: Any, marker: str) -> bool:
     """判断注入内容是否已经在里面了（幂等检查）。"""
     if not marker:
